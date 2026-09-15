@@ -19,6 +19,12 @@ out/
 generated/
 *.lint.json
 
+# ---- A1 本地工具链（约 1.5GB）----
+# bazelisk / bazel 二进制 + Bazel 的 output_user_root（含 external/ 下的
+# 嵌套 git 仓库）。全部隔离在工程内以免污染 ~/.cache。
+# 重建方式： scripts/bootstrap_xls_env.sh
+.tools/
+
 # ---- 第三方源码（合计约 470MB，各自是独立 git 仓库，非 submodule）----
 # 拉取方式见 docs/third-party-INDEX.md
 third_party/

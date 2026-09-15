@@ -1,0 +1,10 @@
+exports_files([
+    "build_defs.bzl",
+    "bzl.bzl",
+])
+
+filegroup(
+    name = "bzl",
+    srcs = ["build_defs.bzl", "bzl.bzl"],
+    visibility = ["//visibility:public"],
+)

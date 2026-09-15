@@ -1,0 +1,7 @@
+exports_files(["providers.bzl"])
+
+filegroup(
+    name = "providers_bzl",
+    srcs = ["providers.bzl"],
+    visibility = ["//visibility:public"],
+)

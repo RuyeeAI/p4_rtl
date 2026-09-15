@@ -1,0 +1,53 @@
+# XLS 根 BUILD 的精简版 —— 由 scripts/patch_xls_module.sh 应用。
+# 原文件会被备份为 third_party/xls/BUILD.orig。
+#
+# ============================ 为什么需要这个 ============================
+# 原版根 BUILD 里有两处对**已摘除依赖**的引用，而根 BUILD 是**必然会被加载**的：
+#
+#   xls/common/BUILD 等处的 cc_library 通过 Bazel 的
+#       package(default_applicable_licenses = ["//:license"])
+#   机制**隐式依赖 `//:license`**。这个 target 定义在根 BUILD 里，
+#   于是只要构建任何一个 xls/* 下的 C++ 目标，根包就会被加载。
+#
+# 而原版根 BUILD 里有：
+#   load("@hedron_compile_commands//:refresh_compile_commands.bzl",
+#        "refresh_compile_commands")           ← 依赖已删除
+#   tools = ["@com_google_fuzztest//bazel:setup_configs"]   ← 依赖已删除
+#
+# 报错形态（实测）：
+#   ERROR: error loading package '': Unable to find package for
+#   @@[unknown repo 'hedron_compile_commands' requested from @@]//:
+#   refresh_compile_commands.bzl: No repository visible as
+#   '@hedron_compile_commands' from main repository.
+#
+# 这两个依赖都属于「开发者便利工具」，与构建产物无关：
+#   - hedron_compile_commands 只用来生成 compile_commands.json
+#   - fuzztest 的 genrule 只是为了校验 fuzztest.bazelrc 与生成版一致
+# 所以直接从根 BUILD 里去掉，不必为此引入依赖。
+#
+# ============================ 保留了什么 ============================
+#   - package(default_applicable_licenses = ["//:license"])  ← 必须保留
+#   - license(name = "license")                              ← 被上面引用
+#   - default_visibility = ["//xls:xls_internal"]            ← xls/BUILD 定义，无重依赖
+#   - exports_files                                          ← 无副作用的文件导出
+#
+# ============================ 还原方式 ============================
+#   scripts/patch_xls_module.sh restore
+
+load("@rules_license//rules:license.bzl", "license")
+
+package(
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//xls:xls_internal"],
+    licenses = ["notice"],  # Apache 2.0
+)
+
+license(
+    name = "license",
+    package_name = "xls",
+)
+
+exports_files([
+    "LICENSE",
+    "mkdocs.yml",
+])

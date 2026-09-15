@@ -1,0 +1,183 @@
+# XLS 轻量构建用的 MODULE.bazel —— 由 scripts/patch_xls_module.sh 应用到
+# third_party/xls/MODULE.bazel（原文件会被备份为 MODULE.bazel.orig）。
+#
+# ============================ 为什么需要这个 ============================
+# 原版 MODULE.bazel 是给「全功能 XLS」用的，包含大量与 IR 解析/代码生成
+# 完全无关的重量级依赖。Bzlmod 是**全图解析**：只要某个 module 在依赖图里，
+# Bazel 就必须拉它的源码才能读它的 BUILD 文件。于是即便我们只想编译
+# //xls/ir:ir_parser，也会被迫下载：
+#
+#   - OpenROAD（git_override + init_submodules=True，含全部 submodule，GB 级）
+#   - LLVM 源码（llvm_raw_ext → @llvm-project）
+#   - 12 个 PDK（SkyWater sky130 六个变体 + ASAP7 三个，每个 GB 级）
+#   - Yosys / Icarus Verilog（rules_hdl tools extension）
+#   - Perfetto、Verible、qt-bazel（OpenROAD GUI 预编译）
+#   - Maven/JUnit（perfetto 连带）、rules_android、rules_closure
+#
+# 实测：直连 GitHub 的 git clone 约 30KB/s，跑 6 分钟只拉到 8.6MB 就卡在
+# OpenROAD 上。按这个速度要几小时到几十小时，且磁盘要几十 GB。
+#
+# 而实测确认 xls/ir/BUILD、xls/common/BUILD、xls/codegen/BUILD 中
+# openroad / rules_hdl / llvm-project / perfetto / verible 出现次数**均为 0**。
+# 也就是说这条闭包根本不需要它们。
+#
+# 本文件只保留 ir_parser 闭包实际会用到的依赖，把它们从图里摘掉。
+#
+# ============================ 裁剪清单 ============================
+# 已删除：
+#   bazel_dep llvm              + register_toolchains(@llvm) + llvm_raw_ext
+#                               + llvm_configure + zlib-ng/zstd 的 llvm_* 别名
+#   bazel_dep rules_hdl         + git_override + tools_extension + pdks_extension
+#   bazel_dep openroad          + git_override(init_submodules)
+#   bazel_dep qt-bazel / rules_7zip / rules_pycross override
+#   bazel_dep verible / perfetto(+ext) / rules_android / rules_jvm_external
+#                               + maven extension
+#   bazel_dep fuzztest / bant / hedron_compile_commands（dev-only，且用不上）
+#   single_version_override sed / m4 / gawk / tcl_lang（openroad、rules_hdl 用）
+#
+# 保留但去掉 dev_dependency 标记（因为 xls/*/BUILD 里有 label 引用它们，
+# 若无条件删掉，Bazel 加载 BUILD 时会报「no repository visible as @...」）：
+#   googletest、google_benchmark
+#
+# 保留（ir/codegen 闭包需要，或从 BCR 拉取成本可接受）：
+#   见下方 bazel_dep 列表
+#
+# ============================ 还原方式 ============================
+#   scripts/patch_xls_module.sh restore
+
+module(
+    name = "xls",
+    repo_name = "com_google_xls",
+)
+
+# ---------------------------------------------------------------- Python
+bazel_dep(name = "rules_python", version = "1.9.0")
+
+PYTHON_VERSION = "3.14"
+
+PYTHON_VERSION_NAME = PYTHON_VERSION.replace(".", "_")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    python_version = PYTHON_VERSION,
+)
+
+use_repo(
+    python,
+    project_python = "python_{}".format(PYTHON_VERSION_NAME),
+    project_python_host = "python_{}_host".format(PYTHON_VERSION_NAME),
+)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    timeout = 600000,
+    hub_name = "xls_pip_deps",
+    python_version = PYTHON_VERSION,
+    requirements_lock = "//dependency_support:pip_requirements_lock.txt",
+)
+use_repo(pip, "xls_pip_deps")
+
+# ------------------------------------------------------- 核心 C++ 依赖
+bazel_dep(name = "abseil-cpp", version = "20260526.0")
+bazel_dep(name = "abseil-py", version = "2.1.0")
+bazel_dep(name = "bazel_features", version = "1.41.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "boringssl", version = "0.20250114.0")
+bazel_dep(name = "cppitertools", version = "2.2")
+
+bazel_dep(name = "googleapis", version = "0.0.0-20240819-fe8ba054a")
+single_version_override(
+    module_name = "googleapis",
+    version = "0.0.0-20240819-fe8ba054a",
+)
+
+bazel_dep(name = "grpc", version = "1.80.0")
+single_version_override(
+    module_name = "grpc",
+    patch_strip = 1,
+    patches = ["//dependency_support/grpc:typing_extensions.patch"],
+)
+
+bazel_dep(name = "linenoise", version = "2.0.0.bcr.1")
+bazel_dep(name = "nlohmann_json", version = "3.12.0.bcr.1")
+
+bazel_dep(name = "or-tools", version = "9.15")
+single_version_override(
+    module_name = "or-tools",
+    patch_strip = 1,
+    patches = [
+        "//dependency_support/or-tools:make_pdlp_public.patch",
+        "//dependency_support/or-tools:use_absl_source_location.patch",
+    ],
+    version = "9.15",
+)
+
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "protobuf", version = "33.0")
+single_version_override(
+    module_name = "protobuf",
+    patch_strip = 1,
+    patches = ["//dependency_support/protobuf:fix_system_python.patch"],
+    version = "33.5",
+)
+
+bazel_dep(name = "mpfr", version = "4.2.2")
+bazel_dep(name = "gmp", version = "6.3.0.bcr.1")
+bazel_dep(name = "re2", version = "2024-07-02.bcr.1")
+bazel_dep(name = "riegeli", version = "0.0.0-20250822-9f2744d")
+bazel_dep(name = "rules_cc", version = "0.2.18")
+bazel_dep(name = "rules_license", version = "1.0.0")
+bazel_dep(name = "rules_proto", version = "7.1.0")
+bazel_dep(name = "rules_shell", version = "0.6.1")
+bazel_dep(name = "with_cfg.bzl", version = "0.14.6")
+# 注意 repo_name 不能省：原版给这两个 bazel_dep 起了 llvm_* 别名，是为了把
+# 不带前缀的 "zlib-ng" / "zstd" 这两个 repo 名让给下面的 extension 使用
+# （extension 用 use_repo 定义 @zstd）。省掉别名会撞名报错。
+bazel_dep(name = "zlib-ng", version = "2.3.3", repo_name = "llvm_zlib")
+bazel_dep(name = "zstd", version = "1.5.7.bcr.1", repo_name = "llvm_zstd")
+bazel_dep(name = "eigen", version = "4.0.0-20241125.bcr.2")
+bazel_dep(name = "rules_pkg", version = "1.2.0")
+bazel_dep(name = "stardoc", version = "0.8.1")
+
+# 这两个在原版里是 dev_dependency，但 xls/ir/BUILD 等文件里有 label 引用，
+# 若整个删掉会让 Bazel 加载 BUILD 时报「no repository visible」。
+bazel_dep(name = "googletest", version = "1.17.0")
+bazel_dep(name = "google_benchmark", version = "1.9.5")
+
+# ------------------------------------------------- 求解器 / 可选组件
+# 以下 extension 的 repo 是**惰性生成**的：use_repo 只是让名字可见，
+# 真正下载发生在有 target 引用时。ir_parser 闭包不引用它们，
+# 所以保留声明不会带来下载成本，同时避免 BUILD 文件里的 label 解析失败。
+z3_ext = use_extension("//dependency_support/z3:extension.bzl", "z3_extension")
+use_repo(z3_ext, "z3")
+
+bitwuzla_ext = use_extension("//dependency_support/bitwuzla:extension.bzl", "bitwuzla_extension")
+use_repo(bitwuzla_ext, "bitwuzla", "cadical", "symfpu")
+
+ac_types_ext = use_extension("//dependency_support/com_github_hlslibs_ac_types:extension.bzl", "ac_types_extension")
+use_repo(ac_types_ext, "ac_datatypes")
+
+zstd_ext = use_extension("//dependency_support/com_github_facebook_zstd:extension.bzl", "zstd_extension")
+use_repo(zstd_ext, "zstd")
+
+# ------------------------------------------------- 存根：rules_hdl
+# XLS 的 xls/build_rules/*.bzl 里有三处引用 @rules_hdl：
+#   xls_rules.bzl:20             → //pdk:build_defs.bzl 的 StandardCellInfo
+#   xls_codegen_fdo_rules.bzl:20 → 同上
+#   xls_macros.bzl:22-23         → //synthesis:build_defs.bzl、//verilog:providers.bzl
+# 而 xls/codegen/BUILD 会 load xls_build_defs.bzl（串到 xls_codegen_fdo_rules.bzl），
+# 导致只要构建任何依赖 //xls/codegen 的目标就会失败。
+#
+# 真正的 rules_hdl 不能引入：它依赖 openroad（git_override + init_submodules，
+# GB 级）、verilator、abc、tcl_lang、rules_7zip、readline、libffi、bzip2、gperf…
+# 且其 openroad 的 git_override 在非 root module 下不生效，会直接解析失败。
+#
+# 但这些引用只服务于「用 Bazel 规则驱动 codegen/综合」的路径，
+# IR 解析校验完全用不到 → 用一个最小存根 repo 顶替。
+bazel_dep(name = "rules_hdl", version = "0.0.0")
+local_path_override(
+    module_name = "rules_hdl",
+    path = "p4xls_harness/rules_hdl_stub",
+)
+
+register_toolchains("//xls/common/toolchains:all")

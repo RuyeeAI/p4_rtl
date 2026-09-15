@@ -1,0 +1,37 @@
+# A1 验证件的 BUILD 定义
+#
+# 由 scripts/setup_xls_harness.sh 复制到 third_party/xls/p4xls_harness/。
+# BUILD 必须位于 XLS 工作区内，才能引用 //xls/ir:* 这些 label。
+#
+# 依赖裁剪原则：只链接 //xls/ir 链路，**不碰** //xls/tools、//xls/jit
+# 或 //xls/common/file（这三条的 BUILD 文件里都有 @llvm-project 引用，
+# 而 @llvm-project 已被轻量 MODULE.bazel 摘掉）。验证见 docs/A1-环境报告.md。
+
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# 诊断用：不依赖任何 //xls/* 包。用来判断 @llvm-project 的 label 解析
+# 错误是出在 XLS 源码层，还是外部 module / toolchain 层。
+cc_binary(
+    name = "probe_minimal",
+    srcs = ["probe_minimal.cc"],
+)
+
+cc_binary(
+    name = "ir_check_main",
+    srcs = ["ir_check_main.cc"],
+    deps = [
+        "//xls/common:init_xls",
+        # 注意：xls/ir 包里没有 :block / :function / :proc 这些独立 target，
+        # block.{h,cc} / function.{h,cc} / proc.{h,cc} 都是 :ir 这个
+        # cc_library 的 srcs/hdrs。写成 :block 会报
+        # "no such target '//xls/ir:block' (did you mean block.h?)"。
+        "//xls/ir",
+        "//xls/ir:ir_parser",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/strings:str_format",
+    ],
+)
