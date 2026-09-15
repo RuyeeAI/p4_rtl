@@ -158,6 +158,28 @@ p4_rtl 与以下两个仓库同属 `Code-Repos/`，**不是第三方依赖，是
   端口生成规则见 `channel_to_port_io_lowering_pass.cc:371`。
 - **纪律**：改接口一律**改 IR 源再重新生成**，不要手改生成的 `.v`（会被覆盖且与源不一致）。
 
+### A2 架构定案 + A2-1 完成（2026-09-16）
+
+- **一个 P4 程序 → 一个 proc**（parser FSM + control FSM 合一）。
+  跨 proc 互连需要 package 级 `chan` 声明 + 绑定（**尚未验证**），
+  单 proc 才是已验证形态。代价：proc 较大。
+- **通道数量不是 II 的瓶颈**：N=2/3/4/6/8 张表（最多 17 个通道）
+  全部最小 II=1、stages 1..4 全可行（`scripts/gen_multichan_probe.py`）。
+- **proc 内可 invoke 纯数据 fn**（fn 被内联展开）→ action 复用 `IrText.dump`。
+- 三条硬规则（都是踩坑得来，见 `docs/A2-架构设计.md`）：
+  1. **节点 id 必须 package 级全局唯一**（不是每个 fn/proc 各自从 1 编）；
+  2. invoke 返回类型 = **被调函数的返回类型**：纯数据 fn 直接返回其值，
+     只有接受 token 形参的 fn 才返回 `(token, ...)`；
+  3. `receive` 返回 `(token, data)` 元组，取用必须先 `tuple_index`。
+- **代码结构**：`IrText`（单 Dag → 单 `fn`，组合逻辑）+
+  `XlsProc`（proc 形态，时序编排）。两者共用上层持有的 `IdGen`。
+  `XlsProc` 内部登记已发节点名，引用未登记的名字立即抛错。
+- **验证方法（值得复用）**：用 M0 当标尺 —— `p4xls.XlsProcSelfTest`
+  重建 M0 的 proc，再用**同一个 testbench** 仿真，逐项对比结果。
+- 第一个端到端目标定为 **demo3-parser**（纯 parser、无 extern、无表），
+  而非 demo5（带 Register/Counter，extern 状态存放方式尚未验证）。
+- 详见 `docs/A2-架构设计.md`。
+
 ## 技术结论备忘
 
 ### A0 门禁 ✅ 通过（2026-09-15）
