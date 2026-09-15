@@ -10,6 +10,8 @@
 #   2. rsp_in_vld 未拉高之前，result_out_vld 必须一直为 0
 #   3. 给出 rsp 后，result_out 上出现同一数据
 #   4. 换不同等待拍数重跑，行为一致（证明不是死等固定 L 拍）
+#   5. 背压不丢数据：key_out_rdy / result_out_rdy 为 0 期间不得发生传输，
+#      放开后数据完好
 
 set -euo pipefail
 
@@ -31,14 +33,18 @@ gen_only=false
 
 mkdir -p "$OUT"
 
-echo "========== 1/4 IR 语法校验（官方 parser + round-trip） =========="
+echo "========== 1/5 IR 语法校验（官方 parser + round-trip） =========="
 "$ROOT/scripts/xls_ir_verify.sh" --quiet "$IR" | tail -3
 
 echo
-echo "========== 2/4 生成 Verilog =========="
-# 必须带 --wct=2：见报告 F1 —— 「token 链 + 阻塞通道」的 proc 拿不到 II=1，
-# 显式放宽到 2 才能过调度。（注意上游语义：0=不约束，不设=必须为 1）
-"$BIN" "$IR" --top=key_rsp_loop --stages=2 --wct=2 --out="$V"
+echo "========== 2/5 生成 Verilog =========="
+# 配置说明（scripts/ii_sweep.sh 实测）：
+#   本样本用**并行 token**（三个通道操作都直连 state_read(tok)，末尾 after_all 汇聚）
+#   → 最小可行 II = 1，且在 IR 里用 #[initiation_interval(1)] 显式声明，
+#     所以这里**不传 --wct**（II 由 IR 自描述；若传了选项会优先于属性）。
+#   对照样本 m0_key_rsp_loop_serial_token.ir 用串行 token 链，最小 II = 2。
+#   注意上游的 wct 语义坑：0 = 不约束；不设 = 必须为 1；N = 必须恰好为 N。
+"$BIN" "$IR" --top=key_rsp_loop --stages=2 --out="$V"
 
 if $gen_only; then
   echo
@@ -47,11 +53,15 @@ if $gen_only; then
 fi
 
 echo
-echo "========== 3/4 编译 testbench =========="
+echo "========== 3/5 编译 testbench =========="
 iverilog -g2012 -o "$OUT/tb_m0.vvp" "$V" "$TB"
 echo "iverilog 编译通过"
 
 echo
-echo "========== 4/4 时序仿真 =========="
+echo "========== 4/5 时序仿真 =========="
 cd "$ROOT"          # VCD 是相对路径，必须从仓库根跑
 vvp "$OUT/tb_m0.vvp"
+
+echo
+echo "========== 5/5 II 属性核对（并行 token 应为 1） =========="
+"$ROOT/scripts/ii_sweep.sh" "$IR" key_rsp_loop 2 1 | tail -6

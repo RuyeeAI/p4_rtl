@@ -7,6 +7,8 @@
 //    —— 这一条就是"后续逻辑必须等 response 返回才开始工作"
 // 3. 给出 rsp_in_vld + 数据后，result_out 上必须出现**同一数据**
 // 4. **换一个不同的等待拍数重跑，行为一致** —— 证明不是"死等固定 L 拍"
+// 5. **背压不丢数据** —— key_out_rdy / result_out_rdy 为 0 时不得发生传输，
+//    放开后数据必须完好（case 3）
 //
 // 用法
 //   iverilog -o out/m0/tb.vvp out/m0/m0_key_rsp_loop.v testcases/m0/tb_m0_key_rsp_loop.v
@@ -168,6 +170,108 @@ module tb_m0_key_rsp_loop;
   endtask
 
   // ------------------------------------------------------------------
+  // case 3：**背压测试**（key_out_rdy / result_out_rdy 先为 0 再放开）
+  //
+  // 为什么必须测：II=1 版本的 state 更新条件是 stage_outputs_ready_0，
+  // 与 II=2 版本不同。若背压路径有问题，key 或 result 会在下游没准备好时
+  // 被"吃掉"（vld 拉高但传输未被接收，而 phase 仍然推进）。
+  // 这直接决定 A3 的接口契约怎么写。
+  // ------------------------------------------------------------------
+  task run_backpressure_case;
+    integer i;
+    integer key_seen;
+    integer pending_seen;
+    integer result_taken;
+    reg [31:0] got;
+    begin
+      rst            = 1;
+      rsp_in_vld     = 0;
+      rsp_in         = 0;
+      key_out_rdy    = 0;   // 外部存储器尚未准备好
+      result_out_rdy = 0;   // 下游尚未准备好
+      repeat (3) @(posedge clk);
+      @(negedge clk);
+      rst = 0;
+
+      key_seen     = 0;
+      pending_seen = 0;
+      result_taken = 0;
+      got          = 0;
+
+      $display("---- case 3: 背压测试（两个 rdy 先拉 0 再放开）----");
+
+      // 阶段 A：key_out_rdy=0 保持 3 拍 —— 不允许发生 key 传输
+      for (i = 0; i < 3; i = i + 1) begin
+        @(negedge clk); #1;
+        if (key_out_vld && key_out_rdy) begin
+          $display("  [FAIL] key_out_rdy=0 时却发生了 key 传输");
+          errors = errors + 1;
+        end
+      end
+
+      // 阶段 B：放开 key_out_rdy —— key 应被接收且数据正确
+      @(negedge clk); key_out_rdy = 1; #1;
+      if (key_out_vld && key_out_rdy) begin
+        key_seen = 1;
+        if (key_out !== KEY_EXPECTED) begin
+          $display("  [FAIL] key 数据错误: 得到 %h，期望 %h", key_out, KEY_EXPECTED);
+          errors = errors + 1;
+        end
+      end
+
+      // 阶段 C：给 rsp，但 result_out_rdy 仍为 0
+      repeat (2) @(negedge clk);
+      rsp_in     = 32'hcafe_0001;
+      rsp_in_vld = 1;
+      for (i = 0; i < 6; i = i + 1) begin
+        @(negedge clk); #1;
+        if (result_out_vld && !result_out_rdy) pending_seen = 1;
+        if (result_out_vld && result_out_rdy) begin
+          $display("  [FAIL] result_out_rdy=0 时却发生了 result 传输");
+          errors = errors + 1;
+        end
+      end
+
+      // 阶段 D：放开 result_out_rdy —— result 应被接收且数据正确
+      @(negedge clk); result_out_rdy = 1; #1;
+      if (result_out_vld && result_out_rdy) begin
+        result_taken = 1;
+        got          = result_out;
+      end
+      for (i = 0; i < 5 && !result_taken; i = i + 1) begin
+        @(negedge clk); #1;
+        if (result_out_vld && result_out_rdy) begin
+          result_taken = 1;
+          got          = result_out;
+        end
+      end
+
+      if (!key_seen) begin
+        $display("  [FAIL] 放开 key_out_rdy 后未见 key 传输（key 被丢或 phase 提前推进）");
+        errors = errors + 1;
+      end
+      if (!pending_seen) begin
+        $display("  [WARN] rdy=0 期间未观察到 result_out_vld 悬挂");
+      end
+      if (!result_taken) begin
+        $display("  [FAIL] 放开 result_out_rdy 后未见 result 传输");
+        errors = errors + 1;
+      end else if (got !== 32'hcafe_0001) begin
+        $display("  [FAIL] result 数据错: 得到 %h，期望 cafe0001", got);
+        errors = errors + 1;
+      end else if (key_seen) begin
+        $display("  [ok] 背压下 key 与 result 均未丢失，数据正确 = %h", got);
+      end
+
+      key_out_rdy    = 1;
+      result_out_rdy = 1;
+      rsp_in_vld     = 0;
+      repeat (2) @(posedge clk);
+      $display("");
+    end
+  endtask
+
+  // ------------------------------------------------------------------
   initial begin
     $dumpfile("out/m0/tb_m0.vcd");
     $dumpvars(0, tb_m0_key_rsp_loop);
@@ -180,6 +284,7 @@ module tb_m0_key_rsp_loop;
     // 两个 case 用**不同的等待拍数**，用来排除"死等固定 L 拍"的可能
     run_case(2, 32'hdead_beef, 1);
     run_case(7, 32'h1234_5678, 2);
+    run_backpressure_case;
 
     $display("======================================================");
     if (errors == 0) begin

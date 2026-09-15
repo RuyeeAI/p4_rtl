@@ -1,4 +1,4 @@
-// M0 打样：Key/Response 握手闭环的最小 proc
+// M0 打样：Key/Response 握手闭环的最小 proc（**II=1 版本**）
 //
 // ============================ 验证目标 ============================
 // 问题（方案里的头号风险）：
@@ -15,36 +15,44 @@
 //
 //   IDLE ──(发 key)──→ WAIT ──(收到 rsp)──→ DISPATCH ──(分发结果)──→ IDLE
 //
-// 三个通道都用 streaming + ready_valid（带背压的流式通道）：
+// 三个通道都用 streaming + ready_valid：
 //   key_out     : 我发给外部存储器的查找键
 //   rsp_in      : 外部存储器返回的 response
 //   result_out  : 拿到 response 后才开始工作的后续逻辑输出
 //
-// 两个语法要点（都是 verifier 教出来的）：
-//   1. **strictness 必填**。日志：
-//        verifier.cc:384: channel_interface->strictness().has_value()
-//        ChannelInterface `key_out` in proc `key_rsp_loop` is streaming but
-//        has no strictness value
-//      老式 chan 声明不写时默认 proven_mutually_exclusive（ir_parser.cc:2964），
-//      但 proc-scoped 的 chan_interface 走 SetStrictness(optional)，
-//      缺省即 nullopt → 校验不过，必须显式写。
-//      本文件的每个通道都只有**一个** send/receive 语句，多个操作之间
-//      不可能同拍并发，所以 proven_mutually_exclusive 是严格成立的。
-//   2. flop_kind 用 none（官方样本的普遍取值）。这里不做额外打拍，
-//      保持"发出即到"的语义，便于观察时序。
-//
-// **关键机制**：`receive(predicate=is_wait, channel=rsp_in)`
-//   - 当 phase==WAIT 且 rsp_in 上**没有数据**时，predicate 为真但数据未就绪
-//     → 按 XLS 的 ready/valid 语义，整个 proc 迭代被 stall（不推进）
-//   - 于是 phase 的 next_value 一起被推迟，state 保持不变
-//   - 数据到达的那一拍，receive 完成，phase 推进到 DISPATCH
+// **关键机制 1（时序契约）**：`receive(predicate=is_wait, channel=rsp_in)`
+//   - phase==WAIT 且 rsp_in 上**没有数据**时，predicate 为真但数据未就绪
+//     → 整个 proc 迭代被 stall（不推进），state 保持不变
+//   - 数据到达的那一拍 receive 完成，phase 推进到 DISPATCH
 //   → **这就是"等到 response 返回"的自然表达，不需要显式计数 L。**
 //
-// 本文件要验证的就是上面这条推理在生成的 RTL 里是否真的成立。
+// **关键机制 2（II=1，P0 的结论）**：三个通道操作**互不串链**
+//   串行 token 链（旧版 m0_key_rsp_loop_serial_token.ir）：
+//       state_read(tok) → send(key) → receive(rsp) → send(result) → next(tok)
+//   这条链是**循环携带依赖**，跨多拍 → 实测最小 II = 2 且 stages=1 完全不可调度。
+//   本版改成**并行 token**：三个通道操作都直接接 state_read(tok)，
+//   末尾用 after_all 汇聚：
+//       s_key = send(tok__1, ...)
+//       recv  = receive(tok__1, ...)
+//       s_out = send(tok__1, ...)
+//       next(tok) = after_all(s_key, tok__2, s_out)
+//   → 实测 **最小 II = 1**（stages 1..4 全部可行），且功能由 testbench 复验不变。
+//   并在 IR 里用 #[initiation_interval(1)] 显式声明。
+//
+//   语义等价性：三个操作的 predicate（is_idle / is_wait / is_disp）按 FSM 相位
+//   **互斥**，不会同拍为真，所以去掉串行 token 依赖不影响功能正确性。
+//
+// **这两个机制都必须由生成的 RTL 与仿真来确认，不能只看推理。**
 
 package m0_key_rsp
 
-proc key_rsp_loop<
+// II 由 **IR 自己声明**（不在 driver 参数里指定），这样生成的 .ir 是自描述的，
+// 任何 XLS 工具都能正确处理。
+// 依据：run_pipeline_schedule.cc:464-520 —— 当命令行没有 wct 时，
+// 调度器会读 proc 的 initiation_interval 属性。
+// 注意：若同时给了 --wct=N，**选项优先**于属性。
+#[initiation_interval(1)]
+top proc key_rsp_loop<
     key_out: bits[64] out,
     rsp_in: bits[32] in,
     result_out: bits[32] out
@@ -54,6 +62,9 @@ proc key_rsp_loop<
     rsp_hold: bits[32],
     init={token, 0, 0}
 ) {
+  // 三个通道都用 proven_mutually_exclusive：每个通道只有一个 send/receive
+  // 语句，多个操作之间不可能同拍并发，故严格成立。
+  // 注意 strictness 是**必填项**（proc-scoped chan_interface 没有默认值）。
   chan_interface key_out(direction=send, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
   chan_interface rsp_in(direction=receive, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
   chan_interface result_out(direction=send, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
@@ -64,61 +75,54 @@ proc key_rsp_loop<
   rsp_hold__1: bits[32] = state_read(state_element=rsp_hold, id=3)
 
   // ---- 相位判定 ----
-  phase_idle: bits[2] = literal(value=0, id=4)
-  phase_wait: bits[2] = literal(value=1, id=5)
-  phase_disp: bits[2] = literal(value=2, id=6)
-  is_idle: bits[1] = eq(phase__1, phase_idle, id=7)
-  is_wait: bits[1] = eq(phase__1, phase_wait, id=8)
-  is_disp: bits[1] = eq(phase__1, phase_disp, id=9)
+  p_idle: bits[2] = literal(value=0, id=4)
+  p_wait: bits[2] = literal(value=1, id=5)
+  p_disp: bits[2] = literal(value=2, id=6)
+  is_idle: bits[1] = eq(phase__1, p_idle, id=7)
+  is_wait: bits[1] = eq(phase__1, p_wait, id=8)
+  is_disp: bits[1] = eq(phase__1, p_disp, id=9)
 
   // ---- IDLE：发出查找键 ----
   // 真实场景里 key 由 parser 抽出的 PHV 字段 concat 而成；
   // M0 用常量，把变量收敛到"时序契约"这一个问题上。
   key: bits[64] = literal(value=11936128518282651045, id=10)
-  s_key: token = send(tok__1, key, predicate=is_idle, channel=key_out, id=11)
 
-  // ---- WAIT：等 response（本文件的核心）----
-  // predicate 为真但数据未就绪时，本拍迭代被 stall —— 这就是"等"。
-  recv: (token, bits[32]) = receive(s_key, predicate=is_wait, channel=rsp_in, id=12)
+  // ---- 三个通道操作：都直接接 tok__1，互不串链（这是 II=1 的关键）----
+  //
+  // IDLE 拍发 key
+  s_key: token = send(tok__1, key, predicate=is_idle, channel=key_out, id=11)
+  // WAIT 拍收 response（阻塞点）
+  recv: (token, bits[32]) = receive(tok__1, predicate=is_wait, channel=rsp_in, id=12)
   tok__2: token = tuple_index(recv, index=0, id=13)
   rsp: bits[32] = tuple_index(recv, index=1, id=14)
-
-  // ---- DISPATCH：拿到 response 后才开始工作的后续逻辑 ----
-  // 用 rsp_hold 而不是直接用 rsp：rsp 只在 WAIT 拍有效，
-  // 在 DISPATCH 拍要用上一拍保存下来的值。
-  s_out: token = send(tok__2, rsp_hold__1, predicate=is_disp, channel=result_out, id=15)
+  // DISPATCH 拍发结果（用 rsp_hold 而不是 rsp：rsp 只在 WAIT 拍有效）
+  s_out: token = send(tok__1, rsp_hold__1, predicate=is_disp, channel=result_out, id=15)
 
   // ---- 相位推进 ----
-  // IDLE(0) → WAIT(1) → DISPATCH(2) → IDLE(0)
-  //
-  // 两个语法要点（都踩过）：
-  //   1. sel 的 cases 是**值列表**，按 selector 取值顺序索引，
-  //      不是 (key, value) 元组列表：sel(s, cases=[v0,v1,v2]) 表示
-  //      s==0 取 v0、s==1 取 v1……
-  //   2. cases 的元素必须是**已定义的节点引用**（标识符），不能写字面量。
-  next_idle: bits[2] = literal(value=0, id=21)
-  next_wait: bits[2] = literal(value=1, id=22)
-  next_disp: bits[2] = literal(value=2, id=23)
+  // sel 的 cases 是**值列表**，按 selector 取值顺序索引；元素必须是已定义的节点引用。
+  n_wait: bits[2] = literal(value=1, id=16)
+  n_disp: bits[2] = literal(value=2, id=17)
+  n_idle: bits[2] = literal(value=0, id=18)
   next_phase: bits[2] = sel(
       phase__1,
-      cases=[next_wait, next_disp, next_idle],
-      default=next_idle,
-      id=16)
+      cases=[n_wait, n_disp, n_idle],
+      default=n_idle,
+      id=19)
 
   // ---- 保存 response ----
   // 只在 WAIT 拍（phase==1）采样 rsp，其余拍保持原值。
-  // 用 sel 门控，避免在 predicate 为假的拍上使用 receive 的输出。
   next_rsp_hold: bits[32] = sel(
       phase__1,
       cases=[rsp_hold__1, rsp, rsp_hold__1],
       default=rsp_hold__1,
-      id=17)
+      id=20)
 
-  // ---- 写回状态 ----
+  // ---- token 汇聚（末尾才合并，不构成串行链）----
+  next_tok_all: token = after_all(s_key, tok__2, s_out, id=21)
+
   // 语法要点：next_value 是普通节点，同样要写 `name: type = ` 前缀，
-  // 且它的返回类型是空元组 `()`。官方写法形如：
-  //   next_value.13: () = next_value(state_element=my_token, value=..., id=13)
-  next_value.18: () = next_value(state_element=tok, value=s_out, id=18)
-  next_value.19: () = next_value(state_element=phase, value=next_phase, id=19)
-  next_value.20: () = next_value(state_element=rsp_hold, value=next_rsp_hold, id=20)
+  // 且它的返回类型是空元组 `()`；节点名后缀必须与 id 一致。
+  next_value.22: () = next_value(state_element=tok, value=next_tok_all, id=22)
+  next_value.23: () = next_value(state_element=phase, value=next_phase, id=23)
+  next_value.24: () = next_value(state_element=rsp_hold, value=next_rsp_hold, id=24)
 }

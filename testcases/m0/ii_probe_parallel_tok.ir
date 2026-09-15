@@ -1,0 +1,82 @@
+// II 实验变体 B3：**并行 token**（候选方案 c 的实现）
+//
+// ============================ 与基线（B4）的唯一差别 ============================
+// 基线 B4 里三个通道操作串在同一条 token 链上：
+//     state_read(tok) → send(key) → receive(rsp) → send(result) → next_value(tok)
+// 于是「通道操作」全落在这条**循环携带依赖**路径上。
+//
+// 本变体把三个通道操作**都直接接在 state_read(tok) 上，互不串链**：
+//     s_key = send(tok__1, ...)
+//     recv  = receive(tok__1, ...)
+//     s_out = send(tok__1, ...)
+//     next_value(tok) = after_all(s_key, tok__2, s_out)   ← 只在末尾汇聚
+//
+// 语义等价性：三个操作的 predicate（is_idle / is_wait / is_disp）按 FSM 相位
+// **互斥**，不会同拍为真，所以去掉串行 token 依赖不影响功能正确性。
+//
+// 要回答的问题：II 的瓶颈是「通道操作本身」，还是「token 串链形成的循环携带依赖」？
+//   - 若 B3 的 min II = 1 → 瓶颈是 token 串链，候选 (c) 是解法
+//   - 若 B3 的 min II 仍 = 2 → 通道操作本身必然 II≥2（XLS 固有），(c) 无解
+
+package ii_probe_par_tok
+
+top proc key_rsp_par<
+    key_out: bits[64] out,
+    rsp_in: bits[32] in,
+    result_out: bits[32] out
+>(
+    tok: token,
+    phase: bits[2],
+    rsp_hold: bits[32],
+    init={token, 0, 0}
+) {
+  chan_interface key_out(direction=send, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
+  chan_interface rsp_in(direction=receive, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
+  chan_interface result_out(direction=send, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
+
+  // ---- 读状态 ----
+  tok__1: token = state_read(state_element=tok, id=1)
+  phase__1: bits[2] = state_read(state_element=phase, id=2)
+  rsp_hold__1: bits[32] = state_read(state_element=rsp_hold, id=3)
+
+  // ---- 相位判定 ----
+  p_idle: bits[2] = literal(value=0, id=4)
+  p_wait: bits[2] = literal(value=1, id=5)
+  p_disp: bits[2] = literal(value=2, id=6)
+  is_idle: bits[1] = eq(phase__1, p_idle, id=7)
+  is_wait: bits[1] = eq(phase__1, p_wait, id=8)
+  is_disp: bits[1] = eq(phase__1, p_disp, id=9)
+
+  key: bits[64] = literal(value=11936128518282651045, id=10)
+
+  // ---- 三个通道操作：都直接接 tok__1，互不串链 ----
+  s_key: token = send(tok__1, key, predicate=is_idle, channel=key_out, id=11)
+  recv: (token, bits[32]) = receive(tok__1, predicate=is_wait, channel=rsp_in, id=12)
+  tok__2: token = tuple_index(recv, index=0, id=13)
+  rsp: bits[32] = tuple_index(recv, index=1, id=14)
+  s_out: token = send(tok__1, rsp_hold__1, predicate=is_disp, channel=result_out, id=15)
+
+  // ---- 相位推进 ----
+  n_wait: bits[2] = literal(value=1, id=16)
+  n_disp: bits[2] = literal(value=2, id=17)
+  n_idle: bits[2] = literal(value=0, id=18)
+  next_phase: bits[2] = sel(
+      phase__1,
+      cases=[n_wait, n_disp, n_idle],
+      default=n_idle,
+      id=19)
+
+  // ---- 保存 response ----
+  next_rsp_hold: bits[32] = sel(
+      phase__1,
+      cases=[rsp_hold__1, rsp, rsp_hold__1],
+      default=rsp_hold__1,
+      id=20)
+
+  // ---- token 汇聚（末尾才合并）----
+  next_tok_all: token = after_all(s_key, tok__2, s_out, id=21)
+
+  next_value.22: () = next_value(state_element=tok, value=next_tok_all, id=22)
+  next_value.23: () = next_value(state_element=phase, value=next_phase, id=23)
+  next_value.24: () = next_value(state_element=rsp_hold, value=next_rsp_hold, id=24)
+}
