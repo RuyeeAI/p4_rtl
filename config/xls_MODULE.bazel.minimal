@@ -74,6 +74,14 @@ pip.parse(
     hub_name = "xls_pip_deps",
     python_version = PYTHON_VERSION,
     requirements_lock = "//dependency_support:pip_requirements_lock.txt",
+    # PyPI 直连在本网络不可用（实测报
+    #   "Could not find a version that satisfies the requirement numpy==2.3.4
+    #    (from versions: none)"
+    # ——这不是版本问题，而是根本连不上索引）。改走清华镜像。
+    extra_pip_args = [
+        "--index-url=https://pypi.tuna.tsinghua.edu.cn/simple",
+        "--retries=3",
+    ],
 )
 use_repo(pip, "xls_pip_deps")
 
@@ -148,6 +156,15 @@ bazel_dep(name = "google_benchmark", version = "1.9.5")
 # 以下 extension 的 repo 是**惰性生成**的：use_repo 只是让名字可见，
 # 真正下载发生在有 target 引用时。ir_parser 闭包不引用它们，
 # 所以保留声明不会带来下载成本，同时避免 BUILD 文件里的 label 解析失败。
+#
+# ⚠️ 教训：裁剪时**不要删 extension 声明**。它们的下载是惰性的（零成本），
+# 但删掉会让「加载某个 BUILD 文件」直接失败 —— 与依赖图无关，很难排查。
+# 已因此踩过两次：
+#   - @pprof     被 //xls/passes/tools 引用（codegen 链路会加载该包）
+#   - @rules_hdl 被 xls/build_rules/*.bzl 引用（那个用存根顶替，见下）
+pprof_ext = use_extension("//dependency_support/pprof:extension.bzl", "pprof_extension")
+use_repo(pprof_ext, "pprof")
+
 z3_ext = use_extension("//dependency_support/z3:extension.bzl", "z3_extension")
 use_repo(z3_ext, "z3")
 
@@ -178,6 +195,46 @@ bazel_dep(name = "rules_hdl", version = "0.0.0")
 local_path_override(
     module_name = "rules_hdl",
     path = "p4xls_harness/rules_hdl_stub",
+)
+
+# ------------------------------------------------- 存根：at_clifford_yosys（Yosys）
+# 这个 repo 在原版里由 rules_hdl 的 tools_extension 生成，内容是 Yosys。
+# XLS 侧有两处引用：
+#   1. xls/synthesis/yosys/BUILD 的 yosys_util → //:json11
+#   2. xls/build_rules/*.bzl、xls/scheduling/BUILD → //:yosys（Label 默认值）
+# 只要构建链上加载到 xls/synthesis/yosys 这个包，就会因 repo 缺失而失败：
+#   no such package '@at_clifford_yosys//': No repository visible as ...
+#
+# 它不是 module 而是 repo，所以用 use_repo_rule + local_repository 挂载。
+# 存根里 json11 用真源码（yosys_util.cc 真的会 include 它），
+# yosys 用占位脚本（只在数据流里作 Label，不会被调用）。
+local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
+local_repository(
+    name = "at_clifford_yosys",
+    path = "p4xls_harness/yosys_stub",
+)
+
+# ------------------------------------------------- 存根：llvm module
+# 为什么"只为了一个工具"也要顶替整个 LLVM module：
+#   xls/build_rules/xls_ir_rules.bzl:1469 有一行
+#       default = Label("@llvm//tools:clang-format")
+#   即某个 rule 的格式化工具默认值。`@llvm` 来自 BCR 的 llvm module，
+#   而它会把 LLVM toolchain 一起带进来（GB 级源码 + 长编译）。
+#
+#   实测这条引用的触发路径是：
+#     //xls/codegen_v_1_5:codegen
+#       → //xls/estimators/delay_model:delay_estimator
+#         → //xls/estimators/delay_model/models:model_unit_source
+#           → models/BUILD 的 xls_default_delay_models 宏
+#             → xls_estimator_rules.bzl → …→ xls_ir_rules.bzl:1469
+#
+#   **注意**：本存根不注册 C++ toolchain，所以不会影响 Bazel 默认的
+#   C++ toolchain 解析（原版的
+#   `register_toolchains("@llvm//toolchain:all")` 已被裁掉）。
+bazel_dep(name = "llvm", version = "0.8.18")
+local_path_override(
+    module_name = "llvm",
+    path = "p4xls_harness/llvm_stub",
 )
 
 register_toolchains("//xls/common/toolchains:all")

@@ -1,0 +1,32 @@
+// II 基线实验：最简的「只有 send」的 proc
+//
+// 目的：把「token 状态回边经过通道操作」这一个变量单独隔离出来。
+//   状态回边 = state_read(tok) → send → next_value(tok)，只有 2 跳。
+//   如果连它都拿不到 II=1，那么结论就是：
+//     **只要状态回边里出现通道操作，II=1 就不可达** —— 与 FSM 复杂度无关。
+//
+// 与 m0_key_rsp_loop.ir 的差别：没有 receive、没有 FSM、没有多余状态。
+//
+// 语法要点（本次踩到，A2 生成器必须遵守）：
+//   - 节点名形如 `<op>.<N>` 时，**后缀 N 必须等于 `id=` 的属性值**
+//     （报错原文：The id '1' in node name literal.1 does not match
+//      the id '2' specified as an attribute）
+//   - 引用必须先于定义（报错原文：Referred to a name ... that was not
+//      previously defined）
+
+package ii_probe_send
+
+proc send_only<
+    key_out: bits[64] out
+>(
+    tok: token,
+    init={token}
+) {
+  chan_interface key_out(direction=send, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
+
+  tok__1: token = state_read(state_element=tok, id=1)
+  pred: bits[1] = literal(value=1, id=2)
+  key: bits[64] = literal(value=11936128518282651045, id=3)
+  s_key: token = send(tok__1, key, predicate=pred, channel=key_out, id=4)
+  next_value.5: () = next_value(state_element=tok, value=s_key, id=5)
+}

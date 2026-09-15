@@ -35,3 +35,41 @@ cc_binary(
         "@abseil-cpp//absl/strings:str_format",
     ],
 )
+
+# 自建 Verilog codegen 驱动（M0 用）。
+#
+# 刻意**不**链接 //xls/tools:codegen —— 那条链是：
+#   //xls/tools:codegen → //xls/fdo:synthesizer
+#     → //xls/synthesis/yosys:yosys_synthesis_service
+#       → @at_clifford_yosys//:json11   （需要 Yosys 与 json11）
+#
+# 干净入口在 //xls/codegen_v_1_5:codegen：实测其 BUILD 里
+# fdo/yosys/llvm/jit 出现次数均为 0，且它正是新式 proc 走的 codegen 路径。
+cc_binary(
+    name = "verilog_codegen_main",
+    srcs = ["verilog_codegen_main.cc"],
+    deps = [
+        "//xls/codegen:codegen_options",
+        "//xls/codegen:codegen_result",
+        "//xls/codegen_v_1_5:codegen",
+        # **必须有**：codegen 的默认 pass 注册表。
+        # xls::codegen::Codegen() 内部会做
+        #   GetCodegenPassRegistry().Generator("default_pipeline")
+        # 而这个名为 default_pipeline 的 compound pass 由
+        # xls_default_codegen_pass_registry(name="passes") 提供。
+        # 它不在 :codegen 的 deps 里（官方是 //xls/tools:codegen 显式依赖
+        # //xls/codegen_v_1_5:passes，xls/tools/BUILD:845）。
+        # 漏掉它的症状是：
+        #   default_pipeline is not registered. Have [opt_pass<...>, ...]
+        # 注意这个错误**只在调度成功之后**才会出现 —— 调度失败时会先报
+        # "cannot achieve full throughput"，很容易误判成调度问题。
+        "//xls/codegen_v_1_5:passes",
+        "//xls/common:init_xls",
+        "//xls/estimators/delay_model:delay_estimator",
+        "//xls/ir",
+        "//xls/ir:ir_parser",
+        "//xls/scheduling:scheduling_options",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+    ],
+)

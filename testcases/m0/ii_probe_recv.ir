@@ -1,0 +1,22 @@
+// II 基线实验：最简的「只有 receive」的 proc
+//
+// 目的：与 ii_probe_send.ir 配对，隔离「阻塞式 receive」对 II 的影响。
+//   状态回边 = state_read(tok) → receive → next_value(tok)，2 跳。
+//   receive 的 predicate 恒为 1 → 每拍都尝试接收，没数据就 stall。
+
+package ii_probe_recv
+
+proc recv_only<
+    rsp_in: bits[32] in
+>(
+    tok: token,
+    init={token}
+) {
+  chan_interface rsp_in(direction=receive, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
+
+  tok__1: token = state_read(state_element=tok, id=1)
+  pred: bits[1] = literal(value=1, id=2)
+  recv: (token, bits[32]) = receive(tok__1, predicate=pred, channel=rsp_in, id=3)
+  tok__2: token = tuple_index(recv, index=0, id=4)
+  next_value.5: () = next_value(state_element=tok, value=tok__2, id=5)
+}

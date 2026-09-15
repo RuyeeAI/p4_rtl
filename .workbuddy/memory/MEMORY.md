@@ -64,9 +64,14 @@ p4_rtl 与以下两个仓库同属 `Code-Repos/`，**不是第三方依赖，是
 ### A1 环境 ✅ 通过（2026-09-15）
 
 - XLS 环境**源码自建**（官方只发 linux-x64；conda litex-hub 只有 linux-64；本机无容器）。
-  三处补丁：轻量 `MODULE.bazel`（摘 OpenROAD/LLVM/PDK）、`.bazelrc`（注释悬空的
-  `--@llvm-project//...` Starlark flag）、精简根 `BUILD`（去掉 hedron/fuzztest）；
-  外加 `@rules_hdl` 最小存根。详见 `docs/A1-环境报告.md`。
+  补丁共 **5 处**（`scripts/patch_xls_module.sh` + `patch_xls_macos.py`，绑 commit `49c163e`）：
+  ① 轻量 `MODULE.bazel`（摘 OpenROAD/LLVM/PDK）② `.bazelrc`（注释悬空的
+  `--@llvm-project//...` Starlark flag）③ 精简根 `BUILD`（去掉 hedron/fuzztest）
+  ④ **空归档**：`xls_pass_rules.bzl`/`xls_estimator_rules.bzl` 补锚点 TU
+  （macOS libtool 拒绝空归档，Linux GNU ar 接受 → 上游 CI 不暴露）
+  ⑤ **`xls/common/subprocess.cc` 可移植化**：`memfd_create` → 临时文件 + `/dev/fd`
+  外加三个存根 repo：`@rules_hdl`、`@at_clifford_yosys`（含真 json11）、`@llvm//tools:clang-format`。
+  详见 `docs/A1-环境报告.md`。
 - 真实 parser 复验：P4C 的 25 个 `.ir` **25/25** 且 round-trip 逐字节稳定；
   官方样本 745/768 = 97%；**proc + channel 4/4** → A2 语法前提成立。
 - 三条环境约束：GitHub 直连不可用（走 gh-proxy 镜像）；本机透明代理会让 Bazel 报 502
@@ -89,6 +94,32 @@ p4_rtl 与以下两个仓库同属 `Code-Repos/`，**不是第三方依赖，是
 4. **M1 回归语料**：**先实测自研 P4C 对官方 `p4c/p4_16_samples` 的通过率**，拿量化指标后再定语料策略。
 
 详见 `docs/A2-启动前决策盘点.md`。
+
+### M0 接口打样 ✅ 通过（2026-09-16）—— 时序契约成立
+
+- 结论：`send key → 等 response 返回 → 分发` 在 XLS 里**成立**。
+  已生成 Verilog（`out/m0/m0_key_rsp_loop.v`）并用 **iverilog 仿真实证**：
+  等待 2 拍 → result 第 4 拍；等待 7 拍 → result 第 9 拍，差值恒为 2 拍（流水深度）
+  → 延迟随 rsp 到达线性变化，**不是死等固定 L 拍**。
+- 一键复现：`scripts/m0_verify.sh`（IR 校验 → 生成 Verilog → 仿真）。详见 `docs/M0-接口打样报告.md`。
+- 自建 codegen driver：`xls_harness/verilog_codegen_main.cc`
+  （链 `//xls/codegen_v_1_5:codegen` **+ `:passes`**，自实现 unit delay estimator）。
+- 六个坑（详见报告 §3）：
+  - **K3 最坑**：漏 `//xls/codegen_v_1_5:passes` → `default_pipeline is not registered`。
+    该错误**只在调度成功之后才出现**，极易误判为调度问题；且报错列表里"看起来有"该项。
+    官方 `xls/tools/BUILD:845` 有显式依赖，`//xls/codegen_v_1_5:codegen` 没有。
+    → **教训：自建 driver 时要逐个对照官方 main 的 deps，特别是注册表/插件式 alwayslink 依赖。**
+    → **判定法**：用官方最小 proc 样本 `xls/ir/testdata/ir_parser_round_trip_test_ParseIIProc.ir`
+      复现同一错误 → 即为工具链问题，不是自己的 IR 问题。
+  - **K1**：`token 链 + 阻塞通道` 的 proc **拿不到 II=1**
+    （依据 `run_pipeline_schedule.cc:232-242`）。`--stages=2 --wct=2` 是当前可用配置。
+    **对 PISA「一拍一包」是硬约束，A2 编排水法必须先决策**（拆 proc / 接受 II=2 / 不把 token 写回 state）。
+  - **K2**：`worst_case_throughput` 语义反直觉 —— **0 = 不约束**；**不设 = 必须为 1**；N = 必须为 N。
+  - **K4**：`clock_name` 必填（`scheduled_block_conversion_pass.cc:56-61`）。
+  - **K5**：proc-scoped `chan_interface` 的 `strictness` 必填（老式 chan 有默认值，proc-scoped 没有）。
+  - **K6**：IR 文本里节点名 `<op>.<N>` 的后缀 N 必须等于 `id=`；引用必须先于定义。
+- **对 A3 接口规范的直接影响**：XLS 生成的 `rsp_in_rdy` 语义是「本拍完成一次接收」，
+  **不是「我随时能收」**（无数据时也为 0）。外部存储器/表接口**不能把 rdy 当"可以发"的许可**。
 
 ## 技术结论备忘
 

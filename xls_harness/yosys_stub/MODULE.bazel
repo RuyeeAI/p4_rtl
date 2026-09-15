@@ -1,0 +1,2 @@
+# 存根 repo 的 module 声明，让 Bazel 把它认作合法 repo 根。
+module(name = "at_clifford_yosys", version = "0.0.0-stub")

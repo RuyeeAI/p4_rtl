@@ -1,0 +1,21 @@
+# @llvm//tools 的最小存根。
+#
+# 真实情况：BCR 的 `llvm` module 提供 LLVM 工具链与一批工具。
+# XLS 侧只用到其中一个 ——
+#   xls/build_rules/xls_ir_rules.bzl:1469
+#       default = Label("@llvm//tools:clang-format")
+# 即某个 rule 的格式化工具默认值。
+#
+# 仅仅为了一个「默认值 Label」，就要引入 GB 级的 LLVM 源码与 toolchain，
+# 代价完全不成比例。所以这里用占位脚本顶替。
+#
+# 注意：本存根**不注册任何 C++ toolchain**，因此不会影响 Bazel 自身
+# 的默认 C++ toolchain 解析（原版 XLS 里的
+# `register_toolchains("@llvm//toolchain:all")` 已被裁掉）。
+
+package(default_visibility = ["//visibility:public"])
+
+sh_binary(
+    name = "clang-format",
+    srcs = ["clang_format_placeholder.sh"],
+)

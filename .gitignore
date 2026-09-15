@@ -29,3 +29,7 @@ generated/
 # 拉取方式见 docs/third-party-INDEX.md
 third_party/
 third_party/xls/p4xls_harness/
+
+# ---- Python 缓存 ----
+__pycache__/
+*.pyc
