@@ -1,0 +1,10 @@
+// p4c: package Demo7RuntimeTable
+// p4c: fn rt_table_rt_table_set_port
+// p4c-params: in___rtarg_p=in:__rtarg.p
+// p4c-params: in___rtarg_t=in:__rtarg.t
+// p4c-sinks: out:meta.normPort:16,out:meta.tag:8
+package Demo7RuntimeTable
+
+fn rt_table_rt_table_set_port(in___rtarg_p: bits[16], in___rtarg_t: bits[8]) -> (bits[16], bits[8]) {
+  ret sinks: (bits[16], bits[8]) = tuple(in___rtarg_p, in___rtarg_t)
+}

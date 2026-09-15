@@ -1,0 +1,91 @@
+# 项目约定 — p4_rtl
+
+> 项目目标：P4 → RTL 方向（调研/自研）。长期笔记，按主题维护。
+
+## 目录约定
+
+- 根目录：`/Users/haoyu/Documents/01-Work/Code-Repos/p4_rtl`
+- `docs/` — 调研报告与说明文档
+- `third_party/` — 第三方仓库源码（每个依赖一个子目录，独立 git 仓库，非 submodule）
+- `.workbuddy/memory/` — 工作日志
+
+## 工程结构（2026-09-15 起，p4_rtl 已是可运行 sbt 工程）
+
+> 项目目标：P4 → XLS IR → RTL。**2026-09-15 起工程化**，不再是纯文档目录。
+
+- 构建：sbt 1.12.6 + Scala 2.13.12，**纯 Scala、无 chisel3 依赖**，可打成轻量 fat jar。
+- `src/main/scala/P4C/` — fork 自 `../P4C`（17 文件 / 5,381 行，基线 commit `8c7eaaf`），**包名保持 `P4C`** 便于与上游 diff。
+- `src/main/scala/p4xls/Main.scala` — 顶层 CLI（`p4c` / `lint-ir` / `version`）。
+- `scripts/gen_op_contracts.py` — 从 XLS `ir_parser.cc` 自动提取 op 参数契约 → `config/op_contracts.json`（84 条）。
+- `scripts/xls_ir_lint.py` — XLS IR 文本静态校验器（A0 门禁核心工具）。
+- `scripts/p4xls` — CLI 包装，用 `java -cp target/scala-2.13/classes:<scala-library>` 直跑，绕过 sbt 启动开销。
+- `testcases/ir/` — 门禁基准（当前 P4C 产出的 25 个 `.ir`）；`testcases/ir_legacy_pre_a0/` — 修复前旧样本。
+- 门禁命令：`sbt xlsIrLint` 或 `scripts/p4xls lint-ir <dir>`。
+- **third_party/xls 已 gitignore**（155MB），拉取方式见 `docs/third-party-xls.md`。
+
+## 环境限制
+
+- **沙箱只能写工作区内**（`p4_rtl/` 之下）。写父目录 `Code-Repos/` 等会报 `Operation not permitted`，需提权。
+- macOS 无 `timeout` 命令，长耗时网络操作需后台 + kill 轮询，或设 `GIT_HTTP_LOW_SPEED_TIME` / `GIT_HTTP_LOW_SPEED_LIMIT`。
+- **Homebrew 安装在沙箱内必然失败**：`brew install bazelisk` 因 `/opt/homebrew/var/homebrew/locks/...`
+  被拒（`Operation not permitted @ apply2files`）。需在沙箱外装。
+- 本机**无 bazel / conda**，因此 XLS 无法构建；有 verilator / iverilog / cmake / ninja / clang。
+- 坑：Scala 注释**可嵌套**，文档注释里出现 `/*`（如写 `out/ir/*.ir`）会导致 `unclosed comment`。
+
+## 第三方依赖拉取规范
+
+1. 统一放 `third_party/<repo-name>/`
+2. 网络受限环境走镜像 git 智能 HTTP（详见 skill `github-mirror-download`）
+3. 每个依赖在 `docs/third-party-<name>.md` 写一份拉取记录：上游 URL、commit、日期、体积、校验结果、更新命令、构建要点
+4. 远端固定配两个：`origin`（github 直连）、`mirror`（镜像优先）
+5. 浅克隆后补 `--unshallow`，保证历史完整（便于查版本回溯）
+
+## 已落地的第三方依赖
+
+| 依赖 | 路径 | 版本 | 用途 |
+|---|---|---|---|
+| google/xls | `third_party/xls/` | `49c163e` (2026-09-11) | HLS 工具链，DSLX→Verilog，P4→RTL 后端候选 |
+
+## 本地可复用资产（同机其他仓库）
+
+p4_rtl 与以下两个仓库同属 `Code-Repos/`，**不是第三方依赖，是自家资产**，可直接复用：
+
+| 仓库 | 路径 | 是什么 | 关键价值 |
+|---|---|---|---|
+| P4C | `../P4C` | 自研 P4→Chisel 编译器（Scala/sbt，main 5,381 行 / test 3,635 行，185 tests 绿） | 已把 IR 文本格式**逐语法对齐 google/xls 的 `.ir`**；已完成 X8–X14 的 XLS 对齐 |
+| p4x | `../p4x` | 工具链统一入口（775 行 Python，stdlib-only，子命令 sim/chisel/ppal/all） | `dist/bin/` 有 macOS/arm64 构建好的官方 `p4c-bm2-ss` + bmv2 `simple_switch` + `p4include` + `p4chisel.jar` |
+
+- **P4C 的 `.ir` 输出实测存在**：`P4C/build/demo{9,10,11}/ir/*.ir`，语法对照 XLS IR 合法。
+- **唯一缺口 = Top 时序编排**：`IrText.dump` 只能 dump 单个 Dag → 单个 `fn`，无 proc/通道。但 Chisel 侧已做成（`generated/p4c/Demo5Pipeline.scala` 的 `_Ingress`/`_TopParser`/`_Top`）。
+- 复用度：约 2,900 行（54%）直接复用；`ChiselBackend` 1,426 行需改写为 `XlsBackend`；`SchedulePass`+`DelayModel` 542 行在 XLS 路线下可暂缓。
+- p4x 的 `dist/` 依赖 Homebrew 6 个 dylib 绝对路径，换机/CI 需收口；p4x 非 git 仓库。
+- 详见 `docs/复用资产审计-本地P4C与p4x.md`。
+
+## 技术结论备忘
+
+### A0 门禁 ✅ 通过（2026-09-15）
+
+- P4C 产出的 25 个 `.ir`（11 个 demo）语法校验 **25/25 通过**，整条路线成立。
+- **唯一不兼容点（已修）**：`array_index(arr, idx)` 必须写成 `array_index(arr, indices=[idx])`。
+  根因：`ir_parser.cc` 的 `kArrayIndex` 用 `AddKeywordArg("indices")` + `Run(arity=1)`，
+  而 `ArgParser::Run`（`:329-376`）把位置参数与关键字参数**分开解析**，`indices` 是 mandatory keyword。
+  修复位置：`IrText.scala:128`（生成）/ `:304`（解析）。
+- 已确认兼容：`//` 行注释（`ir_scanner.cc:156`）、`ret name: (T,) = tuple(...)`、
+  `sel(cond, cases=[])` 无 default、`zero_ext(x, new_bit_count=N)`、`bits[16][8]` 数组类型。
+- 校验器可信度：用 XLS 自带 768 个 `.ir` 做正样本，纯 `fn` 子集 **468/493 = 94.9%**。
+- 报告：`docs/A0-门禁报告.md`。
+- **未覆盖**：A0 只验证了 `fn` 形态；`proc`/通道编排（A2）的语法正确性待 A2 首检。
+
+- 详见 `docs/P4转RTL开源工具调研.md`：GitHub 无活跃开源全流程 P4→RTL 工具；Match-Action 单元 RTL 生成是完全空白。
+- 详见 `docs/p4c-xls后端扩展方案.md`（**v2**）：p4c → DSLX → XLS codegen 路线的工作分解。三条硬结论：
+  1. XLS IR 仅 79 个 op，**无存储器/CAM 原语**。
+  2. 推荐 p4c 只做 frontend+midend 输出 **PIR JSON**，DSLX 生成器用 Python 写（解耦、迭代快、PIR 可复用）。
+  3. XLS 产出的是通用数据流调度结果，与 PISA "一表一 stage" 结构不对齐。
+
+## 项目范围约定（v2，2026-09-15 郝宇确认）
+
+- **Match 阶段只生成 Key/Response 接口，不生成存储本体**。表存储与匹配算法（EM/LPM/TCAM）全部外置，XLS 侧只输出 key、接收 response。
+- **本期不支持 PISA ALU 阵列**：不做 stage 内 ALU 资源预算、多表同 stage 打包、确定性流水划分；接受 XLS 自动调度结果。
+- 因此头号风险从"表存储 RTL 自研"变为**访存延迟的时序契约**（XLS proc 每拍迭代 vs 外部存储器 1–4 拍延迟）。接口按握手定义、实现先走计数状态，**M0 必须验证此闭环**。
+- 工作量基线：MVP 5.5–8.5 人月；到基线评测 8–12.5 人月；ALU 阵列 + 真实存储 IP 预留 +4–8 人月。
+- 项目定位 0：产出的是"**P4 逻辑 → RTL 生成器**"，不是"P4 → 完整可编程数据面"。存储、状态、调度全部外置。

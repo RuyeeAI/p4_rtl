@@ -1,0 +1,9 @@
+// p4c: package Demo7RuntimeTable
+// p4c: fn table_static_table_set_stat
+// p4c-sinks: out:meta.stat:8
+package Demo7RuntimeTable
+
+fn table_static_table_set_stat() -> (bits[8]) {
+  n0: bits[8] = literal(value=5)
+  ret sinks: (bits[8]) = tuple(n0)
+}

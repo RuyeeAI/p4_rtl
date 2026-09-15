@@ -1,0 +1,20 @@
+// p4c: package Demo9L3forwarder
+// p4c: fn rt_table_l3_fwd_forward
+// p4c-params: in___rtarg_port=in:__rtarg.port
+// p4c-params: in___rtarg_c=in:__rtarg.c
+// p4c-params: in_hdr_ipv4_ttl=in:hdr.ipv4.ttl
+// p4c-params: in_hdr_ipv4_totalLen=in:hdr.ipv4.totalLen
+// p4c-params: reg_portBytes=reg:portBytes
+// p4c-sinks: out:meta.normPort:16,out:meta.cls:8,out:hdr.ipv4.ttl:8,cnt:classPkts:4:32,reg:portBytes:8:16
+package Demo9L3forwarder
+
+fn rt_table_l3_fwd_forward(in___rtarg_port: bits[16], in___rtarg_c: bits[8], in_hdr_ipv4_ttl: bits[8], in_hdr_ipv4_totalLen: bits[16], reg_portBytes: bits[16][8]) -> (bits[16], bits[8], bits[8], bits[2], bits[32], bits[3], bits[16]) {
+  n0: bits[8] = literal(value=1)
+  n1: bits[8] = sub(in_hdr_ipv4_ttl, n0)
+  n2: bits[2] = bit_slice(in___rtarg_c, start=0, width=2)
+  n3: bits[32] = literal(value=1)
+  n4: bits[3] = bit_slice(in___rtarg_port, start=0, width=3)
+  n5: bits[16] = array_index(reg_portBytes, indices=[n4])
+  n6: bits[16] = add(n5, in_hdr_ipv4_totalLen)
+  ret sinks: (bits[16], bits[8], bits[8], bits[2], bits[32], bits[3], bits[16]) = tuple(in___rtarg_port, in___rtarg_c, n1, n2, n3, n4, n6)
+}

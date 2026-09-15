@@ -1,0 +1,9 @@
+// p4c: package Demo9L3forwarder
+// p4c: fn rt_table_acl_trap
+// p4c-sinks: out:meta.dropFlag:8
+package Demo9L3forwarder
+
+fn rt_table_acl_trap() -> (bits[8]) {
+  n0: bits[8] = literal(value=1)
+  ret sinks: (bits[8]) = tuple(n0)
+}

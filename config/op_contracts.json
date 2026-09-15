@@ -1,0 +1,776 @@
+{
+  "_source": "third_party/xls/xls/ir/ir_parser.cc",
+  "_note": "由 gen_op_contracts.py 从 XLS ir_parser.cc 提取；arity=-1 表示可变参数",
+  "contracts": {
+    "after_all": {
+      "op": "AfterAll",
+      "positional": [
+        "token*"
+      ],
+      "arity": -1,
+      "mandatory_keywords": [],
+      "optional_keywords": []
+    },
+    "array": {
+      "op": "Array",
+      "positional": [],
+      "arity": -1,
+      "mandatory_keywords": [],
+      "optional_keywords": []
+    },
+    "array_concat": {
+      "op": "ArrayConcat",
+      "positional": [],
+      "arity": -1,
+      "mandatory_keywords": [],
+      "optional_keywords": []
+    },
+    "array_index": {
+      "op": "ArrayIndex",
+      "positional": [
+        "array"
+      ],
+      "arity": 1,
+      "mandatory_keywords": [
+        "indices[]"
+      ],
+      "optional_keywords": [
+        "assumed_in_bounds"
+      ]
+    },
+    "array_slice": {
+      "op": "ArraySlice",
+      "positional": [],
+      "arity": 2,
+      "mandatory_keywords": [
+        "width"
+      ],
+      "optional_keywords": []
+    },
+    "array_update": {
+      "op": "ArrayUpdate",
+      "positional": [
+        "array",
+        "update_value"
+      ],
+      "arity": 2,
+      "mandatory_keywords": [
+        "indices[]"
+      ],
+      "optional_keywords": [
+        "assumed_in_bounds"
+      ]
+    },
+    "assert": {
+      "op": "Assert",
+      "positional": [],
+      "arity": 2,
+      "mandatory_keywords": [
+        "message"
+      ],
+      "optional_keywords": [
+        "label"
+      ]
+    },
+    "bit_slice": {
+      "op": "BitSlice",
+      "positional": [
+        "operand"
+      ],
+      "arity": 1,
+      "mandatory_keywords": [
+        "start",
+        "width"
+      ],
+      "optional_keywords": []
+    },
+    "bit_slice_update": {
+      "op": "BitSliceUpdate",
+      "positional": [
+        "operand",
+        "start",
+        "update_value"
+      ],
+      "arity": 3,
+      "mandatory_keywords": [],
+      "optional_keywords": []
+    },
+    "concat": {
+      "op": "Concat",
+      "positional": [
+        "operand*"
+      ],
+      "arity": -1,
+      "mandatory_keywords": [],
+      "optional_keywords": []
+    },
+    "counted_for": {
+      "op": "CountedFor",
+      "positional": [],
+      "arity": 1,
+      "mandatory_keywords": [
+        "trip_count",
+        "body"
+      ],
+      "optional_keywords": [
+        "stride",
+        "invariant_args[]"
+      ]
+    },
+    "cover": {
+      "op": "Cover",
+      "positional": [],
+      "arity": 1,
+      "mandatory_keywords": [
+        "label"
+      ],
+      "optional_keywords": []
+    },
+    "decode": {
+      "op": "Decode",
+      "positional": [],
+      "arity": 1,
+      "mandatory_keywords": [
+        "width"
+      ],
+      "optional_keywords": []
+    },
+    "dynamic_bit_slice": {
+      "op": "DynamicBitSlice",
+      "positional": [],
+      "arity": 2,
+      "mandatory_keywords": [
+        "width"
+      ],
+      "optional_keywords": []
+    },
+    "dynamic_counted_for": {
+      "op": "DynamicCountedFor",
+      "positional": [],
+      "arity": 3,
+      "mandatory_keywords": [
+        "body"
+      ],
+      "optional_keywords": [
+        "invariant_args[]"
+      ]
+    },
+    "encode": {
+      "op": "Encode",
+      "positional": [],
+      "arity": 1,
+      "mandatory_keywords": [],
+      "optional_keywords": []
+    },
+    "gate": {
+      "op": "Gate",
+      "positional": [
+        "condition",
+        "operand"
+      ],
+      "arity": 2,
+      "mandatory_keywords": [],
+      "optional_keywords": [
+        "gate_type"
+      ]
+    },
+    "input_port": {
+      "op": "InputPort",
+      "positional": [],
+      "arity": 0,
+      "mandatory_keywords": [
+        "name"
+      ],
+      "optional_keywords": [
+        "sv_type"
+      ]
+    },
+    "instantiation_input": {
+      "op": "InstantiationInput",
+      "positional": [],
+      "arity": 1,
+      "mandatory_keywords": [
+        "instantiation",
+        "port_name"
+      ],
+      "optional_keywords": []
+    },
+    "instantiation_output": {
+      "op": "InstantiationOutput",
+      "positional": [],
+      "arity": 0,
+      "mandatory_keywords": [
+        "instantiation",
+        "port_name"
+      ],
+      "optional_keywords": []
+    },
+    "invoke": {
+      "op": "Invoke",
+      "positional": [],
+      "arity": -1,
+      "mandatory_keywords": [
+        "to_apply"
+      ],
+      "optional_keywords": []
+    },
+    "literal": {
+      "op": "Literal",
+      "positional": [],
+      "arity": 0,
+      "mandatory_keywords": [
+        "value"
+      ],
+      "optional_keywords": []
+    },
+    "map": {
+      "op": "Map",
+      "positional": [],
+      "arity": 1,
+      "mandatory_keywords": [
+        "to_apply"
+      ],
+      "optional_keywords": []
+    },
+    "min_delay": {
+      "op": "MinDelay",
+      "positional": [
+        "token"
+      ],
+      "arity": 1,
+      "mandatory_keywords": [
+        "delay"
+      ],
+      "optional_keywords": []
+    },
+    "next": {
+      "op": "Next",
+      "positional": [],
+      "arity": 0,
+      "mandatory_keywords": [
+        "value"
+      ],
+      "optional_keywords": [
+        "param",
+        "state_element",
+        "predicate",
+        "label"
+      ]
+    },
+    "one_hot": {
+      "op": "OneHot",
+      "positional": [],
+      "arity": 1,
+      "mandatory_keywords": [
+        "lsb_prio"
+      ],
+      "optional_keywords": []
+    },
+    "one_hot_sel": {
+      "op": "OneHotSel",
+      "positional": [
+        "selector"
+      ],
+      "arity": 1,
+      "mandatory_keywords": [
+        "cases[]"
+      ],
+      "optional_keywords": []
+    },
+    "output_port": {
+      "op": "OutputPort",
+      "positional": [],
+      "arity": 1,
+      "mandatory_keywords": [
+        "name"
+      ],
+      "optional_keywords": [
+        "sv_type"
+      ]
+    },
+    "param": {
+      "op": "Param",
+      "positional": [],
+      "arity": 0,
+      "mandatory_keywords": [
+        "name"
+      ],
+      "optional_keywords": []
+    },
+    "priority_sel": {
+      "op": "PrioritySel",
+      "positional": [
+        "selector"
+      ],
+      "arity": 1,
+      "mandatory_keywords": [
+        "cases[]",
+        "default"
+      ],
+      "optional_keywords": []
+    },
+    "receive": {
+      "op": "Receive",
+      "positional": [],
+      "arity": 1,
+      "mandatory_keywords": [
+        "channel"
+      ],
+      "optional_keywords": [
+        "predicate",
+        "blocking"
+      ]
+    },
+    "register_read": {
+      "op": "RegisterRead",
+      "positional": [],
+      "arity": 0,
+      "mandatory_keywords": [
+        "register"
+      ],
+      "optional_keywords": []
+    },
+    "register_write": {
+      "op": "RegisterWrite",
+      "positional": [],
+      "arity": 1,
+      "mandatory_keywords": [
+        "register"
+      ],
+      "optional_keywords": [
+        "load_enable",
+        "reset"
+      ]
+    },
+    "s_mul": {
+      "op": "SMul",
+      "positional": [],
+      "arity": 2,
+      "mandatory_keywords": [],
+      "optional_keywords": []
+    },
+    "s_mulp": {
+      "op": "SMulp",
+      "positional": [],
+      "arity": 2,
+      "mandatory_keywords": [],
+      "optional_keywords": []
+    },
+    "sel": {
+      "op": "Sel",
+      "positional": [
+        "selector"
+      ],
+      "arity": 1,
+      "mandatory_keywords": [
+        "cases[]"
+      ],
+      "optional_keywords": [
+        "default"
+      ]
+    },
+    "send": {
+      "op": "Send",
+      "positional": [],
+      "arity": 2,
+      "mandatory_keywords": [
+        "channel"
+      ],
+      "optional_keywords": [
+        "predicate"
+      ]
+    },
+    "sign_ext": {
+      "op": "SignExt",
+      "positional": [
+        "operand"
+      ],
+      "arity": 1,
+      "mandatory_keywords": [
+        "new_bit_count"
+      ],
+      "optional_keywords": []
+    },
+    "state_read": {
+      "op": "StateRead",
+      "positional": [],
+      "arity": 0,
+      "mandatory_keywords": [
+        "state_element"
+      ],
+      "optional_keywords": [
+        "predicate",
+        "label"
+      ]
+    },
+    "trace": {
+      "op": "Trace",
+      "positional": [],
+      "arity": 2,
+      "mandatory_keywords": [
+        "format",
+        "data_operands[]"
+      ],
+      "optional_keywords": [
+        "verbosity"
+      ]
+    },
+    "tuple": {
+      "op": "Tuple",
+      "positional": [
+        "element*"
+      ],
+      "arity": -1,
+      "mandatory_keywords": [],
+      "optional_keywords": []
+    },
+    "tuple_index": {
+      "op": "TupleIndex",
+      "positional": [
+        "operand"
+      ],
+      "arity": 1,
+      "mandatory_keywords": [
+        "index"
+      ],
+      "optional_keywords": []
+    },
+    "u_mul": {
+      "op": "UMul",
+      "positional": [],
+      "arity": 2,
+      "mandatory_keywords": [],
+      "optional_keywords": []
+    },
+    "u_mulp": {
+      "op": "UMulp",
+      "positional": [],
+      "arity": 2,
+      "mandatory_keywords": [],
+      "optional_keywords": []
+    },
+    "zero_ext": {
+      "op": "ZeroExt",
+      "positional": [
+        "operand"
+      ],
+      "arity": 1,
+      "mandatory_keywords": [
+        "new_bit_count"
+      ],
+      "optional_keywords": []
+    },
+    "add": {
+      "op": "Add",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "and": {
+      "op": "And",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "and_reduce": {
+      "op": "AndReduce",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "eq": {
+      "op": "Eq",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "identity": {
+      "op": "Identity",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "nand": {
+      "op": "Nand",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "ne": {
+      "op": "Ne",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "neg": {
+      "op": "Neg",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "new_channel": {
+      "op": "NewChannel",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "next_value": {
+      "op": "Next",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "nor": {
+      "op": "Nor",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "not": {
+      "op": "Not",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "or": {
+      "op": "Or",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "or_reduce": {
+      "op": "OrReduce",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "recv_channel_end": {
+      "op": "RecvChannelEnd",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "reverse": {
+      "op": "Reverse",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "sdiv": {
+      "op": "SDiv",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "sge": {
+      "op": "SGe",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "sgt": {
+      "op": "SGt",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "sle": {
+      "op": "SLe",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "slt": {
+      "op": "SLt",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "smod": {
+      "op": "SMod",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "smul": {
+      "op": "SMul",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "smulp": {
+      "op": "SMulp",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "send_channel_end": {
+      "op": "SendChannelEnd",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "shll": {
+      "op": "Shll",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "shra": {
+      "op": "Shra",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "shrl": {
+      "op": "Shrl",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "sub": {
+      "op": "Sub",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "udiv": {
+      "op": "UDiv",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "uge": {
+      "op": "UGe",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "ugt": {
+      "op": "UGt",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "ule": {
+      "op": "ULe",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "ult": {
+      "op": "ULt",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "umod": {
+      "op": "UMod",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "umul": {
+      "op": "UMul",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "umulp": {
+      "op": "UMulp",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "xor": {
+      "op": "Xor",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    },
+    "xor_reduce": {
+      "op": "XorReduce",
+      "positional": [],
+      "arity": null,
+      "mandatory_keywords": [],
+      "optional_keywords": [],
+      "source": "op_list.h/default(BinaryOrUnary)"
+    }
+  }
+}

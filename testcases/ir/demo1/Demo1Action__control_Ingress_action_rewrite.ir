@@ -1,0 +1,16 @@
+// p4c: package Demo1Action
+// p4c: fn control_Ingress_action_rewrite
+// p4c-params: in_hdr_ethernet_srcAddr=in:hdr.ethernet.srcAddr
+// p4c-sinks: out:hdr.ethernet.etherType:16,out:meta.normPort:16,out:meta.cls:8
+package Demo1Action
+
+fn control_Ingress_action_rewrite(in_hdr_ethernet_srcAddr: bits[48]) -> (bits[16], bits[16], bits[8]) {
+  n0: bits[16] = literal(value=2303)
+  n1: bits[16] = bit_slice(in_hdr_ethernet_srcAddr, start=0, width=16)
+  n2: bits[16] = literal(value=1)
+  n3: bits[16] = add(n1, n2)
+  n4: bits[1] = literal(value=1)
+  n5: bits[16] = shll(n3, n4)
+  n6: bits[8] = literal(value=3)
+  ret sinks: (bits[16], bits[16], bits[8]) = tuple(n0, n5, n6)
+}

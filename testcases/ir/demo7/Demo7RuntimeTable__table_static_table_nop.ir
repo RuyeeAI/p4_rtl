@@ -1,0 +1,7 @@
+// p4c: package Demo7RuntimeTable
+// p4c: fn table_static_table_nop
+package Demo7RuntimeTable
+
+fn table_static_table_nop() -> () {
+  ret sinks: () = tuple()
+}

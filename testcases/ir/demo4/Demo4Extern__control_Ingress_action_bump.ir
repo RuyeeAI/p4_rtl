@@ -1,0 +1,14 @@
+// p4c: package Demo4Extern
+// p4c: fn control_Ingress_action_bump
+// p4c-params: reg_stats=reg:stats
+// p4c-sinks: reg:stats:8:16,cnt:hits:8:32
+package Demo4Extern
+
+fn control_Ingress_action_bump(reg_stats: bits[16][8]) -> (bits[3], bits[16], bits[3], bits[32]) {
+  n0: bits[3] = literal(value=3)
+  n1: bits[16] = array_index(reg_stats, indices=[n0])
+  n2: bits[16] = literal(value=1)
+  n3: bits[16] = add(n1, n2)
+  n4: bits[32] = literal(value=1)
+  ret sinks: (bits[3], bits[16], bits[3], bits[32]) = tuple(n0, n3, n0, n4)
+}

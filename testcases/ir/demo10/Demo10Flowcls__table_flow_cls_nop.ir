@@ -1,0 +1,7 @@
+// p4c: package Demo10Flowcls
+// p4c: fn table_flow_cls_nop
+package Demo10Flowcls
+
+fn table_flow_cls_nop() -> () {
+  ret sinks: () = tuple()
+}

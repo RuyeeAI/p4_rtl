@@ -1,0 +1,7 @@
+// p4c: package Demo2Match
+// p4c: fn table_cls_table_nop
+package Demo2Match
+
+fn table_cls_table_nop() -> () {
+  ret sinks: () = tuple()
+}

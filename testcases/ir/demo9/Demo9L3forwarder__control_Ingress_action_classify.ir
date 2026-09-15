@@ -1,0 +1,33 @@
+// p4c: package Demo9L3forwarder
+// p4c: fn control_Ingress_action_classify
+// p4c-params: in_hdr_ipv4_version=in:hdr.ipv4.version
+// p4c-params: in_hdr_ipv4_diffserv=in:hdr.ipv4.diffserv
+// p4c-params: in_hdr_ipv4_srcAddr=in:hdr.ipv4.srcAddr
+// p4c-params: in_hdr_ipv4_dstAddr=in:hdr.ipv4.dstAddr
+// p4c-params: in_hdr_ipv4_identification=in:hdr.ipv4.identification
+// p4c-sinks: out:meta.badVer:8,out:meta.ecnQ:8,out:meta.flowHash:16,out:meta.swapId:16
+package Demo9L3forwarder
+
+fn control_Ingress_action_classify(in_hdr_ipv4_version: bits[4], in_hdr_ipv4_diffserv: bits[8], in_hdr_ipv4_srcAddr: bits[32], in_hdr_ipv4_dstAddr: bits[32], in_hdr_ipv4_identification: bits[16]) -> (bits[8], bits[8], bits[16], bits[16]) {
+  n0: bits[4] = literal(value=4)
+  n1: bits[1] = eq(in_hdr_ipv4_version, n0)
+  n2: bits[1] = literal(value=0)
+  n3: bits[1] = eq(n1, n2)
+  n4: bits[8] = zero_ext(n3, new_bit_count=8)
+  n5: bits[2] = bit_slice(in_hdr_ipv4_diffserv, start=4, width=2)
+  n6: bits[2] = literal(value=3)
+  n7: bits[1] = eq(n5, n6)
+  n8: bits[8] = literal(value=1)
+  n9: bits[8] = literal(value=0)
+  n10: bits[8] = sel(n7, cases=[n9, n8])
+  n11: bits[16] = literal(value=0)
+  n12: bits[16] = bit_slice(in_hdr_ipv4_srcAddr, start=0, width=16)
+  n13: bits[16] = bit_slice(in_hdr_ipv4_dstAddr, start=0, width=16)
+  n14: bits[16] = xor(n12, n13)
+  n15: bits[16] = add(n14, in_hdr_ipv4_identification)
+  n16: bits[16] = sub(n11, n15)
+  n17: bits[8] = bit_slice(in_hdr_ipv4_identification, start=0, width=8)
+  n18: bits[8] = bit_slice(in_hdr_ipv4_identification, start=8, width=8)
+  n19: bits[16] = concat(n17, n18)
+  ret sinks: (bits[8], bits[8], bits[16], bits[16]) = tuple(n4, n10, n16, n19)
+}

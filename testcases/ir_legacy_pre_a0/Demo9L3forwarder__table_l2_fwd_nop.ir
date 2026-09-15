@@ -1,0 +1,7 @@
+// p4c: package Demo9L3forwarder
+// p4c: fn table_l2_fwd_nop
+package Demo9L3forwarder
+
+fn table_l2_fwd_nop() -> () {
+  ret sinks: () = tuple()
+}

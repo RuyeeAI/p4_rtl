@@ -1,0 +1,24 @@
+# ---- Scala / sbt ----
+target/
+project/target/
+project/project/
+.bsp/
+.bloop/
+metals.sbt
+
+# ---- IDE ----
+.idea/
+*.iml
+.vscode/
+
+# ---- macOS ----
+.DS_Store
+
+# ---- 工具链输出 ----
+out/
+generated/
+*.lint.json
+
+# ---- 第三方源码（合计约 470MB，各自是独立 git 仓库，非 submodule）----
+# 拉取方式见 docs/third-party-INDEX.md
+third_party/
