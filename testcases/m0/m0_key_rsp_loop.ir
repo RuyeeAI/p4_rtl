@@ -15,10 +15,29 @@
 //
 //   IDLE ──(发 key)──→ WAIT ──(收到 rsp)──→ DISPATCH ──(分发结果)──→ IDLE
 //
-// 三个通道都用 streaming + ready_valid：
-//   key_out     : 我发给外部存储器的查找键
-//   rsp_in      : 外部存储器返回的 response
-//   result_out  : 拿到 response 后才开始工作的后续逻辑输出
+// 三个通道都用 streaming，但**流控方式不同**：
+//   key_out     : 我发给外部存储器的查找键      → flow_control=valid_data（无 rdy）
+//   rsp_in      : 外部存储器返回的 response     → flow_control=valid_data（无 rdy）
+//   result_out  : 拿到 response 后才开始工作的后续逻辑输出 → ready_valid（保留 rdy）
+//
+// 为什么 key/rsp 去掉 rdy（2026-09-16 郝宇要求）：
+//   Key/Response 是「XLS 侧 ↔ 外部存储器/加速器」的接口，约定为**无背压**：
+//     - key_out 方向：外部表/存储器被约定**随时可接收**
+//     - rsp_in  方向：外部表/存储器被约定**随时会返回**，XLS 侧不表达"能否接收"
+//   好处：接口位宽与握手逻辑都减半，且绕开了 M0 报告里记的那个坑 ——
+//   XLS 生成的 rdy 语义是「本拍完成一次接收」而非「我随时能收」，
+//   对外部行为模型容易误用。去掉 rdy 后这个歧义不存在了。
+//
+// 代价（必须写进接口契约，见 docs/M0-接口打样报告.md）：
+//   外部侧**不得**在某拍不能接收/返回时让 vld=1 —— 没有 rdy 可供它等待。
+//   若外部真的存在不可用窗口，必须在外部自行缓冲（FIFO）。
+//
+// result_out 保留 ready_valid：下游是 XLS 生成的逻辑/真实下游，背压有意义。
+//
+// 实现依据：FlowControl 枚举共三值（channel.h:301-320），
+//   kValidData 的注释原文即 "This is used when the channel doesn't want to
+//   support backpressure"。codegen 侧只有非 kValidData 才生成 rdy 端口
+//   （channel_to_port_io_lowering_pass.cc:371）。
 //
 // **关键机制 1（时序契约）**：`receive(predicate=is_wait, channel=rsp_in)`
 //   - phase==WAIT 且 rsp_in 上**没有数据**时，predicate 为真但数据未就绪
@@ -65,8 +84,14 @@ top proc key_rsp_loop<
   // 三个通道都用 proven_mutually_exclusive：每个通道只有一个 send/receive
   // 语句，多个操作之间不可能同拍并发，故严格成立。
   // 注意 strictness 是**必填项**（proc-scoped chan_interface 没有默认值）。
-  chan_interface key_out(direction=send, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
-  chan_interface rsp_in(direction=receive, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
+  //
+  // flow_control=valid_data 的语义（channel.h:312-319）：
+  //   "a valid signal indicates that the data is valid, and the receiver is
+  //    presumed to always be ready to accept data. A transaction occurs
+  //    whenever valid is asserted."
+  //   → 生成 <chan>_vld 与 <chan>，**不生成 <chan>_rdy**。
+  chan_interface key_out(direction=send, kind=streaming, strictness=proven_mutually_exclusive, flow_control=valid_data, flop_kind=none)
+  chan_interface rsp_in(direction=receive, kind=streaming, strictness=proven_mutually_exclusive, flow_control=valid_data, flop_kind=none)
   chan_interface result_out(direction=send, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
 
   // ---- 读状态 ----

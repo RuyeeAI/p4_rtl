@@ -142,6 +142,22 @@ p4_rtl 与以下两个仓库同属 `Code-Repos/`，**不是第三方依赖，是
 - 遗留：多通道 / 多表在同一 proc 内的 II 未验证 → **A3 第一个检查点就扫**。
 - 详见 `docs/A2-编排水法定案.md`。
 
+### Key/Response 接口裁剪：去掉 rdy（2026-09-16 郝宇确认）
+
+- **决策**：Key/Response 通道用 `flow_control=valid_data`（**无背压**），
+  即只有 `<chan>` + `<chan>_vld`，**不生成 rdy**。`result_out` 保留 `ready_valid`。
+  IR 里就是一个词：`valid_data` ↔ `ready_valid`。
+- **关键结论（最该记住的一条）**：**stall 与握手协议正交。**
+  proc 的"等"由内部流水控制实现（`stage_outputs_ready_0` 链），
+  **完全不含 rdy 信号** → 去掉 rdy 后"等 response 返回"依然成立（已实测）。
+- **代价**：外部必须"随时可收 key / 随时会返回 rsp"，有不可用窗口需自行缓冲。
+  风险从"协议复杂"转移到"外部必须保证不丢"。
+- 附带收益：`valid_data` 下不存在"rdy 是'本次接收完成'还是'我随时能收'"的歧义。
+- `FlowControl` 枚举有**三**个值（`channel.h:301-320`），不是两个：
+  `kNone`（无流控）/ `kReadyValid` / **`kValidData`**（只有 valid，接收方假定永远 ready）。
+  端口生成规则见 `channel_to_port_io_lowering_pass.cc:371`。
+- **纪律**：改接口一律**改 IR 源再重新生成**，不要手改生成的 `.v`（会被覆盖且与源不一致）。
+
 ## 技术结论备忘
 
 ### A0 门禁 ✅ 通过（2026-09-15）

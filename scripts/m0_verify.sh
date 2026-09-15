@@ -5,13 +5,19 @@
 #   scripts/m0_verify.sh            # 全流程
 #   scripts/m0_verify.sh --gen-only # 只生成 Verilog，不跑仿真
 #
+# 接口形态（2026-09-16 起）
+#   key_out     : send,    flow_control=valid_data → 只有 key_out / key_out_vld
+#   rsp_in      : receive, flow_control=valid_data → 只有 rsp_in  / rsp_in_vld
+#   result_out  : send,    flow_control=ready_valid → result_out / _vld / _rdy
+#   Key/Response 通路为**无背压**接口：vld 单独成立即视为一次传输。
+#
 # 验收标准（见 docs/M0-接口打样报告.md）
-#   1. key_out 上一次 key（数据 = 0xa5a5a5a5a5a5a5a5）
+#   1. key_out_vld 上出现一次 key（数据 = 0xa5a5a5a5a5a5a5a5），且只出现一次
 #   2. rsp_in_vld 未拉高之前，result_out_vld 必须一直为 0
+#      —— 这也是"去掉 rdy 后 receive 是否仍然会等"的回归点
 #   3. 给出 rsp 后，result_out 上出现同一数据
 #   4. 换不同等待拍数重跑，行为一致（证明不是死等固定 L 拍）
-#   5. 背压不丢数据：key_out_rdy / result_out_rdy 为 0 期间不得发生传输，
-#      放开后数据完好
+#   5. result_out 背压不丢数据（key/rsp 已无背压，不适用）
 
 set -euo pipefail
 
