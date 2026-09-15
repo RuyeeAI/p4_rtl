@@ -1,0 +1,71 @@
+// A2 关键技术验证：**proc 里 invoke 一个 fn**（这是复用现有 action 生成器的前提）
+//
+// ============================ 为什么关键 ============================
+// 现有 IrText.dump 已经能把一个 action 的 Dag 发射成 XLS `fn`（A0/A1 已验证 25/25）。
+// A2 要做的是「P4 control 的编排」—— 如果 proc 能 invoke 这些 fn，
+// 就不必把 action 的几百个节点内联进 proc，结构也清晰得多。
+//
+// 官方样本已证明 proc 内 invoke 可行
+// （xls/ir/testdata/..._ParseInvoke.ir、以及同目录里带 token 的 invoke.44）：
+//     invoke.22: (token, bits[8]) = invoke(after_all.20, literal.21, a, b, c,
+//                                         to_apply=__itok__testit__muladd, id=22)
+//     invoke.44: () = invoke(__token, __activated, a, b, c, to_apply=..., id=44)
+//
+// 但「官方样本长这样」不等于「我们的 driver 能处理」，所以这里实测。
+//
+// ============================ 要验的三件事 ============================
+//   1. proc 内 invoke 能被官方 parser 接受；
+//   2. 能被 verifier 接受（token 参数 / 返回 (token, 值) 的类型规则）；
+//   3. 能被 codegen 出 Verilog。
+//
+// 结构（最小）：收一个数 → invoke add_one → 发出去
+//   这里**故意用全串行 token 链**（recv → invoke → send），把变量收敛到
+//   "invoke 本身能不能用"这一个问题上；II 是后一步的事。
+
+package a2_probe_invoke
+
+// 被调用的 fn：与 IrText.dump 的产出形态一致（纯数据，无 token）
+fn add_one(x: bits[32]) -> bits[32] {
+  one: bits[32] = literal(value=1, id=1)
+  ret sum: bits[32] = add(x, one, id=2)
+}
+
+#[initiation_interval(1)]
+top proc invoke_probe<
+    data_in: bits[32] in,
+    data_out: bits[32] out
+>(
+    tok: token,
+    init={token}
+) {
+  chan_interface data_in(direction=receive, kind=streaming, strictness=proven_mutually_exclusive, flow_control=valid_data, flop_kind=none)
+  chan_interface data_out(direction=send, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
+
+  // 注意 id：**整个 package 内全局唯一**（不是每个 fn/proc 各自从 1 开始）。
+  // fn add_one 已用 1..2，所以 proc 从这里往后编。
+  // 踩过的坑：proc 里也从 id=1 开始 → 报
+  //   `ID 1 is not unique; source locations of nodes with same id: [], []`
+  tok__1: token = state_read(state_element=tok, id=11)
+
+  // 收：无 predicate ⇒ 每拍都尝试接收（valid_data 下 vld=1 即完成）
+  recv: (token, bits[32]) = receive(tok__1, channel=data_in, id=12)
+  t1: token = tuple_index(recv, index=0, id=13)
+  got: bits[32] = tuple_index(recv, index=1, id=14)
+
+  // 关键：被调 fn 是**纯数据函数**（无 token 形参），
+  // 所以 invoke 直接返回它的返回值 bits[32]，**不加 token**。
+  //
+  // 踩过的坑：一开始写成 `(token, bits[32]) = invoke(t1, got, to_apply=add_one)`，
+  // 报 `Declared type (token, bits[32]) does not match expected type bits[32]`。
+  // 规则：invoke 的返回类型 = 被调函数的返回类型；只有被调函数**接受 token
+  // 作为形参**时才返回 (token, ...)（官方样本里那类函数名带 __itok__ 前缀）。
+  // 官方 ParseInvoke 样本印证：`ret invoke.3: bits[32] = invoke(x, literal.2, to_apply=bar)`
+  // —— bar 是纯数据 fn，返回 bits[32]。
+  res: bits[32] = invoke(got, to_apply=add_one, id=15)
+
+  // 发：token 链 recv → send（数据链 got → invoke → res → send）
+  s_out: token = send(t1, res, channel=data_out, id=16)
+
+  next_tok_all: token = after_all(s_out, id=17)
+  next_value.18: () = next_value(state_element=tok, value=next_tok_all, id=18)
+}

@@ -1,0 +1,106 @@
+// A2 前置实验：同一 proc 内 **2 张表**（5 个通道）时的最小 II
+//
+// **本文件由 scripts/gen_multichan_probe.py 2 生成，请勿手改。**
+//
+// 目的：回答「一个 proc 里放多少对 Key/Response 通道后 II 会退化？」
+//       A2 架构（整个 control 放进一个 proc）直接依赖这个结论。
+//
+// 结构：IDLE：发 key1 → WAIT1：收 rsp1 → MID1：发 key2 → WAIT2：收 rsp2 → DISPATCH：发 result
+//
+// 与 M0/P0 一致：通道操作都直连 state_read(tok__1)、互不串链；
+// predicate(FSM 相位) 互斥；末尾 after_all 汇聚（5 个操作数）。
+// 第 i 张表（i≥2）的 key 取自上张表的 response —— 复现真实表级串联依赖。
+//
+// 判定：最小 II 是否仍为 1。
+//   scripts/ii_sweep.sh testcases/a2/ii_probe_2tables.ir probe_2tables
+
+package a2_ii_probe_2tbl
+
+#[initiation_interval(1)]
+top proc probe_2tables<
+    key1_out: bits[32] out,
+    rsp1_in: bits[32] in,
+    key2_out: bits[32] out,
+    rsp2_in: bits[32] in,
+    result_out: bits[32] out
+>(
+    tok: token,
+    phase: bits[3],
+    hold1: bits[32],
+    hold2: bits[32],
+    init={token, 0, 0, 0}
+) {
+  chan_interface key1_out(direction=send, kind=streaming, strictness=proven_mutually_exclusive, flow_control=valid_data, flop_kind=none)
+  chan_interface rsp1_in(direction=receive, kind=streaming, strictness=proven_mutually_exclusive, flow_control=valid_data, flop_kind=none)
+  chan_interface key2_out(direction=send, kind=streaming, strictness=proven_mutually_exclusive, flow_control=valid_data, flop_kind=none)
+  chan_interface rsp2_in(direction=receive, kind=streaming, strictness=proven_mutually_exclusive, flow_control=valid_data, flop_kind=none)
+  chan_interface result_out(direction=send, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
+
+  // ---- 读状态 ----
+  tok__1: token = state_read(state_element=tok, id=1)
+  phase__1: bits[3] = state_read(state_element=phase, id=2)
+  hold1__1: bits[32] = state_read(state_element=hold1, id=3)
+  hold2__1: bits[32] = state_read(state_element=hold2, id=4)
+
+  // ---- 相位判定 ----
+  // phase 0 = IDLE：发 key1
+  p_0: bits[3] = literal(value=0, id=5)
+  // phase 1 = WAIT1：收 rsp1
+  p_1: bits[3] = literal(value=1, id=6)
+  // phase 2 = MID1：发 key2
+  p_2: bits[3] = literal(value=2, id=7)
+  // phase 3 = WAIT2：收 rsp2
+  p_3: bits[3] = literal(value=3, id=8)
+  // phase 4 = DISPATCH：发 result
+  p_4: bits[3] = literal(value=4, id=9)
+  is_0: bits[1] = eq(phase__1, p_0, id=10)
+  is_1: bits[1] = eq(phase__1, p_1, id=11)
+  is_2: bits[1] = eq(phase__1, p_2, id=12)
+  is_3: bits[1] = eq(phase__1, p_3, id=13)
+  is_4: bits[1] = eq(phase__1, p_4, id=14)
+
+  // ---- 通道操作：全部直接接 tok__1，互不串链（P0 定案）----
+  key1: bits[32] = literal(value=1001, id=15)
+  s_key1: token = send(tok__1, key1, predicate=is_0, channel=key1_out, id=16)
+  recv1: (token, bits[32]) = receive(tok__1, predicate=is_1, channel=rsp1_in, id=17)
+  t1: token = tuple_index(recv1, index=0, id=18)
+  rsp1: bits[32] = tuple_index(recv1, index=1, id=19)
+  s_key2: token = send(tok__1, hold1__1, predicate=is_2, channel=key2_out, id=20)
+  recv2: (token, bits[32]) = receive(tok__1, predicate=is_3, channel=rsp2_in, id=21)
+  t2: token = tuple_index(recv2, index=0, id=22)
+  rsp2: bits[32] = tuple_index(recv2, index=1, id=23)
+  s_out: token = send(tok__1, hold2__1, predicate=is_4, channel=result_out, id=24)
+
+  // ---- 相位推进（k → k+1；末相位 → 0）----
+  n_0: bits[3] = literal(value=0, id=25)
+  n_1: bits[3] = literal(value=1, id=26)
+  n_2: bits[3] = literal(value=2, id=27)
+  n_3: bits[3] = literal(value=3, id=28)
+  n_4: bits[3] = literal(value=4, id=29)
+  next_phase: bits[3] = sel(
+      phase__1,
+      cases=[n_1, n_2, n_3, n_4, n_0],
+      default=n_0,
+      id=30)
+
+  // ---- 保存各自 response（只在对应 WAIT 相位采样）----
+  next_hold1: bits[32] = sel(
+      phase__1,
+      cases=[hold1__1, rsp1, hold1__1, hold1__1, hold1__1],
+      default=hold1__1,
+      id=31)
+  next_hold2: bits[32] = sel(
+      phase__1,
+      cases=[hold2__1, hold2__1, hold2__1, rsp2, hold2__1],
+      default=hold2__1,
+      id=32)
+
+  // ---- token 汇聚（5 个操作数）----
+  next_tok_all: token = after_all(s_key1, t1, s_key2, t2, s_out, id=33)
+
+  // 语法要点：next_value 要写 `next_value.<id>: () = ` 前缀（M0 K6）
+  next_value.34: () = next_value(state_element=tok, value=next_tok_all, id=34)
+  next_value.35: () = next_value(state_element=phase, value=next_phase, id=35)
+  next_value.36: () = next_value(state_element=hold1, value=next_hold1, id=36)
+  next_value.37: () = next_value(state_element=hold2, value=next_hold2, id=37)
+}
