@@ -5,6 +5,8 @@
 ## 目录约定
 
 - 根目录：`/Users/haoyu/Documents/01-Work/Code-Repos/p4_rtl`
+- **`docs/进度与计划.md` — 进度总览 + 已完成任务点 + 下一步计划（P0–P4）+ 技术债。
+  接手/汇报先看这份。**
 - `docs/` — 调研报告与说明文档
 - `third_party/` — 第三方仓库源码（每个依赖一个子目录，独立 git 仓库，非 submodule）
 - `.workbuddy/memory/` — 工作日志
