@@ -61,6 +61,29 @@ p4_rtl 与以下两个仓库同属 `Code-Repos/`，**不是第三方依赖，是
 - p4x 的 `dist/` 依赖 Homebrew 6 个 dylib 绝对路径，换机/CI 需收口；p4x 非 git 仓库。
 - 详见 `docs/复用资产审计-本地P4C与p4x.md`。
 
+### A1 环境 ✅ 通过（2026-09-15）
+
+- XLS 环境**源码自建**（官方只发 linux-x64；conda litex-hub 只有 linux-64；本机无容器）。
+  三处补丁：轻量 `MODULE.bazel`（摘 OpenROAD/LLVM/PDK）、`.bazelrc`（注释悬空的
+  `--@llvm-project//...` Starlark flag）、精简根 `BUILD`（去掉 hedron/fuzztest）；
+  外加 `@rules_hdl` 最小存根。详见 `docs/A1-环境报告.md`。
+- 真实 parser 复验：P4C 的 25 个 `.ir` **25/25** 且 round-trip 逐字节稳定；
+  官方样本 745/768 = 97%；**proc + channel 4/4** → A2 语法前提成立。
+- 三条环境约束：GitHub 直连不可用（走 gh-proxy 镜像）；本机透明代理会让 Bazel 报 502
+  （**必须清空 `HTTP(S)_PROXY`**）；bazelisk 需固定 `USE_BAZEL_VERSION`（GCS 不可达）。
+- **关键结论：LLVM 不是必需项**。`xls/ir`、`xls/common`、`xls/codegen`、`xls/interpreter`
+  的 BUILD 里 llvm 出现 0 次；只有 `xls/jit`（供 `eval_ir_main`/`eval_proc_main` 加速求值）需要。
+- **依赖模式：不碰 `//xls/tools`**（那些面向用户的完整工具会拉 Yosys/LLVM/OpenROAD/PDK），
+  **自己写最小驱动**（已验证有效：`xls_harness/ir_check_main.cc`）。
+- 门禁命令：`scripts/xls_ir_verify.sh <file|dir>`（先 `source scripts/env.sh`）。
+
+### 待郝宇拍板（见 `docs/A2-启动前决策盘点.md`）
+
+1. 起步方式：先验时序契约（M0）vs 直接写 `XlsBackend`（A2）；我建议 M0。
+2. 面积/时序精度：PDK 存根 vs 引入真 PDK（决定 M4 是否硬交付）。
+3. 双 RTL 路线：`../P4C` 的 Chisel 后端冻结与否；我建议冻结。
+4. M1 回归语料：自写 vs 官方 `p4_16_samples`。
+
 ## 技术结论备忘
 
 ### A0 门禁 ✅ 通过（2026-09-15）
