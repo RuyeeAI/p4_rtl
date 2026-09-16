@@ -81,6 +81,21 @@ object XlsBackend {
     case _ => throw new P4Error(s"行 $line：需要数字字面量")
   }
 
+  /** extern（Register/Counter）与 proc 的对接钩子：由 [[emitPipeline]] 按当前相位构造。
+    *
+    * - `read`：inst 的元素读（array_index）；
+    * - `write`：inst 的元素写（array_update 链 + 相位 sel，最后写胜出）。
+    * 索引/值都已发射成 proc 节点名。 */
+  private final case class ExternHooks(
+    read: (String, String) => String,
+    write: (String, String, String) => Unit,
+  )
+
+  private val NoExtern = ExternHooks(
+    (inst, _) => throw new P4Error(s"XlsBackend：读了未声明的 extern '$inst'"),
+    (inst, _, _) => throw new P4Error(s"XlsBackend：写了未声明的 extern '$inst'"),
+  )
+
   /** 把一个 [[Ir.Dag]] **内联发射**进 proc。
     *
     * 为什么不走 `fn` + `invoke`（A2-0 §2 已验 invoke 可用）：本工程是**单 proc**
@@ -93,6 +108,7 @@ object XlsBackend {
     */
   private def emitDagInto(
     b: Builder, dag: Ir.Dag, inputOf: Seq[String] => String, hint: String,
+    ext: ExternHooks = NoExtern,
   ): Map[Seq[String], String] = {
     val emitted = mutable.HashMap.empty[Ir.NodeId, String]
     // 深度优先：先发操作数再发自身，天然满足 XLS「引用先于定义」
@@ -108,13 +124,20 @@ object XlsBackend {
         // Ir.Mux(c,t,f)：XLS sel 的 cases 按 selector **取值**索引 ⇒ cases = [假臂, 真臂]
         case Ir.Mux(c, t, f, w) => b.sel(go(c), Seq(go(f), go(t)), None, bitsTy(w), s"${hint}_mx")
         case Ir.Bin(op, l, r, w) => b.binOp(opNameOf(op), go(l), go(r), bitsTy(w), s"${hint}_bn")
+        case Ir.RegRead(inst, idx, _, _) => ext.read(inst, go(idx))
         case other => throw new P4Error(
-          s"XlsBackend：proc 内暂不支持 $other 节点（extern 状态未支持）")
+          s"XlsBackend：proc 内暂不支持 $other 节点")
       }
     })
     dag.outputs.foreach {
       case Ir.OutputWrite(_, v, _) => go(v)
-      case s => throw new P4Error(s"XlsBackend：proc 内暂不支持 $s 汇点（extern 状态未支持）")
+      // extern 写：RegWrite 直接写值；CounterAdd 读改写（旧值 + delta）
+      case Ir.RegWrite(inst, idx, v, _, _) => ext.write(inst, go(idx), go(v))
+      case Ir.CounterAdd(inst, idx, delta, w, _) =>
+        val cur = ext.read(inst, go(idx))
+        val inc = b.binOp("add", cur, go(delta), bitsTy(w), s"${hint}_cnt")
+        ext.write(inst, go(idx), inc)
+      case s => throw new P4Error(s"XlsBackend：proc 内暂不支持 $s 汇点")
     }
     dag.outputs.collect { case Ir.OutputWrite(path, v, _) => path -> go(v) }.toMap
   }
@@ -137,8 +160,10 @@ object XlsBackend {
     }.toMap
     val outs = a.body.map {
       case asg: Assign => lowering.lowerAssign(asg.path, asg.expr, binds)
+      // extern 方法调用：Register.write / Counter.count（read 是表达式侧，走 lower）
+      case mc: MethodCall => lowering.lowerMethodCall(mc, binds)
       case st => throw new P4Error(
-        s"行 ${st.line}：XlsBackend 的 action 体暂只支持赋值（extern 方法调用未支持）")
+        s"行 ${st.line}：XlsBackend 的 action 体暂只支持赋值与 extern 方法调用")
     }
     Passes.runAll(ib.finish(outs))
   }
@@ -161,8 +186,6 @@ object XlsBackend {
 
     // ---- 0) 前置检查 ----
     ctrlOpt.foreach { c =>
-      if (c.externs.nonEmpty) throw new P4Error(
-        s"XlsBackend：control '${c.name}' 含 extern 状态（${c.externs.map(_.name).mkString(", ")}）—— 暂不支持")
       if (c.applyBody.isEmpty) throw new P4Error(s"XlsBackend：control '${c.name}' 的 apply 体为空")
     }
 
@@ -261,12 +284,47 @@ object XlsBackend {
     if (hasParser) b.declareState("pkt", bitsTy(PktWindowBits), "0")
     allSlots.foreach(s => b.declareState(s.stateName, bitsTy(s.width), "0"))
 
+    // ---- 6b) extern 状态：每个实例一个**数组** state（A2-5b 前置实验定案：方案 a）。
+    // 与 PHV 槽位的本质区别：extern **跨包持久**，不参与相位 0 的清零。
+    case class ExtState(name: String, inst: String, width: Int, size: Int)
+    val extStates: Seq[ExtState] = ctrlOpt.toSeq.flatMap(_.externs).map { e =>
+      val kind = e.kind match {
+        case "Register" => "reg"
+        case "Counter" => "cnt"
+        case k => throw new P4Error(s"行 ${e.line}：未知 extern '$k'")
+      }
+      ExtState(s"${kind}_${e.name}", e.name, e.width, e.size)
+    }
+    val clash = extStates.map(_.name).toSet.intersect(allSlots.map(_.stateName).toSet)
+    if (clash.nonEmpty) throw new P4Error(s"XlsBackend：extern state 与 PHV 槽位重名：${clash.mkString(", ")}")
+    extStates.foreach { es =>
+      val initVals = Seq.fill(es.size)("0").mkString("[", ", ", "]")
+      b.declareState(es.name, s"bits[${es.width}][${es.size}]", initVals)
+    }
+    val extByName: Map[String, ExtState] = extStates.map(es => es.inst -> es).toMap
+
+    // ---- 6c) extern 观察通道（对应 Chisel 线的 io.ex_<name>）。
+    // **必须有**：没有对外可观测性时，XLS 会把「只写不读」的 state 当死代码
+    // 优化掉（A2-5b 实测：demo5 的 counter 整个消失）。走 valid_data（无背压）
+    // 且不带谓词——观察口尽力而为，绝不反压主数据通路。
+    // 布局：元素 0 在最高位（与 PHV「先声明者在高位」同原则）。
+    extStates.foreach(es =>
+      b.declareChan(s"ex_${es.inst}", "send", es.width * es.size, "valid_data"))
+
     // ---- 7) 读状态 + 相位判据 ----
     val tok = b.stateRead("tok", "token", "tok")
     val ph = b.stateRead("phase", bitsTy(pw), "phase")
     val pkt = if (hasParser) Some(b.stateRead("pkt", bitsTy(PktWindowBits), "pkt")) else None
     val cur: Map[String, String] =
       allSlots.map(s => s.stateName -> b.stateRead(s.stateName, bitsTy(s.width), s.stateName)).toMap
+    // extern 数组：当前读节点（读共用）与下一拍值（写更新）
+    val extCur = mutable.HashMap.empty[String, String]
+    val extNext = mutable.HashMap.empty[String, String]
+    extStates.foreach { es =>
+      val rd = b.stateRead(es.name, s"bits[${es.width}][${es.size}]", es.name)
+      extCur(es.inst) = rd
+      extNext(es.inst) = rd
+    }
     val phaseLit: Seq[String] = (0 until nPhases).map(k => b.literal(k, bitsTy(pw), s"k$k"))
     val isPh: Seq[String] = phaseLit.zipWithIndex.map { case (cl, k) => b.eq(ph, cl, s"is_ph$k") }
     val oneBit = b.literal(1, "bits[1]", "one")
@@ -368,16 +426,33 @@ object XlsBackend {
       stmts.zipWithIndex.foreach { case (stmt, k) =>
         val phK = isPh(ctrlBase + k)
         val tag = s"ns$k"
+
+        /** extern 与 proc 的对接（每个语句相位重建一次，捕获本相位的谓词）：
+          * 读 = array_index；写 = array_update 链 + 相位 sel ——
+          * 同拍多次写后写胜出，不同相位的写互不覆盖。 */
+        def extRead(inst: String, idxNode: String): String = {
+          val es = extByName.getOrElse(inst, throw new P4Error(s"XlsBackend：未声明的 extern '$inst'"))
+          b.arrayIndex(extCur(inst), idxNode, bitsTy(es.width), s"ar_${es.name}")
+        }
+        def extWrite(inst: String, idxNode: String, valNode: String): Unit = {
+          val es = extByName.getOrElse(inst, throw new P4Error(s"XlsBackend：未声明的 extern '$inst'"))
+          val arrTy = s"bits[${es.width}][${es.size}]"
+          val prev = extNext(inst)
+          val upd = b.arrayUpdate(prev, valNode, idxNode, arrTy, s"au_${tag}_$inst")
+          extNext(inst) = b.sel(phK, Seq(prev, upd), Some(prev), arrTy, s"ne_${tag}_$inst")
+        }
+        val ext = ExternHooks(extRead, extWrite)
+
         val outs: Map[Seq[String], String] = stmt match {
           case ActionCall(name, args, ln) =>
             val a = actionOf.getOrElse(name, throw new P4Error(s"行 $ln：未知 action '$name'"))
-            emitDagInto(b, actionDag(a, args, resolver, externMap), inputOf, s"${tag}_$name")
+            emitDagInto(b, actionDag(a, args, resolver, externMap), inputOf, s"${tag}_$name", ext)
 
           case asg: Assign =>
             val ib = new Ir.Builder
             val lowering = new IrBuilder.ExprLowering(resolver, ib, externMap)
             val dag = Passes.runAll(ib.finish(Seq(lowering.lowerAssign(asg.path, asg.expr, Map.empty))))
-            emitDagInto(b, dag, inputOf, tag)
+            emitDagInto(b, dag, inputOf, tag, ext)
 
           case TableApply(name, ln) =>
             val t = tableOf.getOrElse(name, throw new P4Error(s"行 $ln：未知 table '$name'"))
@@ -410,14 +485,14 @@ object XlsBackend {
                   b.eq(kn, b.literal(cv, bitsTy(kw), "ck"), "hit")
                 }
                 val hit = conds.reduceLeft((x, y) => b.binOp("and", x, y, "bits[1]", "hit"))
-                (hit, emitDagInto(b, actionDag(a, e.args, resolver, externMap), inputOf, s"${tag}_${e.action}"))
+                (hit, emitDagInto(b, actionDag(a, e.args, resolver, externMap), inputOf, s"${tag}_${e.action}", ext))
               }
 
             // default 表项的输出作为基线（优先级最低）；各表项按**声明序**优先 ⇒ 倒序嵌套 sel
             val defaultOuts: Map[Seq[String], String] = t.entries.find(_.isDefault).map { e =>
               val a = actionOf.getOrElse(e.action, throw new P4Error(
                 s"行 ${e.line}：table '$name' 的 default 引用了未知 action '${e.action}'"))
-              emitDagInto(b, actionDag(a, e.args, resolver, externMap), inputOf, s"${tag}_dflt_${e.action}")
+              emitDagInto(b, actionDag(a, e.args, resolver, externMap), inputOf, s"${tag}_dflt_${e.action}", ext)
             }.getOrElse(Map.empty)
 
             val touched = (defaultOuts.keySet ++ entryHits.flatMap(_._2.keySet)).toSeq
@@ -449,6 +524,19 @@ object XlsBackend {
     val phv = if (outParts.length == 1) outParts.head
               else b.concat(outParts, bitsTy(phvWidth), "phv")
     val sOut = b.send(tok, phv, "phv_out", Some(isPh(phSend)), "snd")
+
+    // ---- 12b) extern 观察值：逐元素 array_index + concat（元素 0 在最高位）。
+    // 数据取 extNext（本拍处理后的值）—— 观测者看到的是「已含本拍更新」的结果。
+    val extObsSends: Seq[String] = extStates.map { es =>
+      val idxW = widthFor(es.size)
+      val elems = (0 until es.size).map { i =>
+        val ix = b.literal(i, bitsTy(idxW), s"oi_${es.inst}_$i")
+        b.arrayIndex(extNext(es.inst), ix, bitsTy(es.width), s"oe_${es.inst}_$i")
+      }
+      val obs = if (elems.length == 1) elems.head
+                else b.concat(elems, bitsTy(es.width * es.size), s"obs_${es.inst}")
+      b.send(tok, obs, s"ex_${es.inst}", None, s"es_${es.inst}")
+    }
 
     // ---- 13) 相位推进 ----
     val nextPkt: Option[String] = pkt.map { p =>
@@ -493,11 +581,13 @@ object XlsBackend {
     }
 
     // ---- 14) token 汇聚与状态写回 ----
-    val tokAll = b.afterAll(Seq(recvTok, sOut), "next_tok")
+    val tokAll = b.afterAll(Seq(recvTok, sOut) ++ extObsSends, "next_tok")
     b.nextValue("tok", tokAll)
     b.nextValue("phase", nextPhase)
     nextPkt.foreach(v => b.nextValue("pkt", v))
     allSlots.foreach(s => b.nextValue(s.stateName, nextOf(s.stateName)))
+    // extern 数组写回（跨包持久：不在相位 0 清零，只在这里写本拍的变化）
+    extStates.foreach(es => b.nextValue(es.name, extNext(es.inst)))
 
     b.render
   }

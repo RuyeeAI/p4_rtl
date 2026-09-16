@@ -1,0 +1,34 @@
+// A2-5b 前置实验二：数组 state 的两个机制点
+//
+//   实验A：sel 能否作用于**数组类型**（相位化写回 = sel(is_ph, [旧, 新])，靠它）
+//   实验B：next_value 能否带 predicate（XLS 的谓词写回是备选路线）
+//
+// 若 A 通过 → 用现有 selNext 框架（每 state 一个 next_value）；
+// 若 A 失败但 B 通过 → extern 写走 predicated next_value。
+
+package a2_extern_probe2
+
+#[initiation_interval(1)]
+top proc extern_probe2<
+    data_out: bits[16] out
+>(
+    tok: token,
+    mem: bits[16][8],
+    flag: bits[1],
+    init={token, [0, 0, 0, 0, 0, 0, 0, 0], 1}
+) {
+  chan_interface data_out(direction=send, kind=streaming, strictness=proven_mutually_exclusive, flow_control=ready_valid, flop_kind=none)
+
+  tok_1: token = state_read(state_element=tok, id=1)
+  mem_2: bits[16][8] = state_read(state_element=mem, id=2)
+  flag_3: bits[1] = state_read(state_element=flag, id=3)
+  idx_4: bits[3] = literal(value=1, id=4)
+  one_5: bits[16] = literal(value=1, id=5)
+  old_6: bits[16] = array_index(mem_2, indices=[idx_4], id=6)
+  inc_7: bits[16] = add(old_6, one_5, id=7)
+  upd_8: bits[16][8] = array_update(mem_2, inc_7, indices=[idx_4], id=8)
+  sel_mem_9: bits[16][8] = sel(flag_3, cases=[mem_2, upd_8], id=9)
+  snd_10: token = send(tok_1, old_6, channel=data_out, id=10)
+  next_value.11: () = next_value(state_element=mem, value=sel_mem_9, id=11)
+  next_value.12: () = next_value(state_element=tok, value=snd_10, id=12)
+}

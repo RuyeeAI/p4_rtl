@@ -228,6 +228,26 @@ object XlsProc {
       nm
     }
 
+    /** `array_index`：读数组（extern 数组 state 的元素读）。
+      *
+      * 索引必须写关键字形式 `indices=[x]` —— 位置写法会被 XLS ArgParser 拒绝
+      * （kArrayIndex 的 indices 是 mandatory keyword，见 A0 报告）。 */
+    def arrayIndex(arr: String, idx: String, elemTy: String, hint: String = "ai"): String = {
+      val (nm, id) = fresh(hint, elemTy)
+      emit(s"$nm: $elemTy = array_index(${check(arr)}, indices=[${check(idx)}], id=$id)")
+      nm
+    }
+
+    /** `array_update`：写数组的一个元素，返回**整个新数组**。
+      *
+      * ⚠️ 实测（A2-5b 前置实验）：XLS 的 lowering 是**全数组写回** —— 生成的 RTL
+      * 里每个元素都有一个 mux。size=8 无碍；size 上千时应考虑别的形态。 */
+    def arrayUpdate(arr: String, value: String, idx: String, arrTy: String, hint: String = "au"): String = {
+      val (nm, id) = fresh(hint, arrTy)
+      emit(s"$nm: $arrTy = array_update(${check(arr)}, ${check(value)}, indices=[${check(idx)}], id=$id)")
+      nm
+    }
+
     /** `send`。返回新的 token 节点名。 */
     def send(tok: String, data: String, chan: String, predicate: Option[String] = None,
              hint: String = "snd"): String = {

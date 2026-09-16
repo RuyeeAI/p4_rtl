@@ -32,6 +32,7 @@ case "$STEM" in
   demo3-parser)       DEF_TOP="Top_parser";       DEF_TB="$ROOT/testcases/a2/tb_demo3_parser.v" ;;
   demo2-match)        DEF_TOP="Ingress_control";  DEF_TB="$ROOT/testcases/a2/tb_demo2_match.v" ;;
   a2-parser-control)  DEF_TOP="Ingress_pipeline"; DEF_TB="$ROOT/testcases/a2/tb_a2_parser_control.v" ;;
+  demo5-pipeline)     DEF_TOP="Ingress_pipeline"; DEF_TB="$ROOT/testcases/a2/tb_demo5_pipeline.v" ;;
   *)                  DEF_TOP="Top";              DEF_TB="" ;;
 esac
 

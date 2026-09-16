@@ -249,6 +249,22 @@ p4_rtl 与以下两个仓库同属 `Code-Repos/`，**不是第三方依赖，是
 - **交互命令坑：zsh 不做 word splitting**（`set -- $pair` 不分词）——
   WorkBuddy 的 Bash 工具跑 zsh，跨 shell 稳妥的写法是**显式函数传参**。
 
+### A2-5b 完成：Register/Counter extern（数组 state）（2026-09-16）
+
+- **§6 定案：方案 a 成立** —— proc 的 state 可以是数组 `bits[16][8]`。
+  三个机制点：① init 的数组字面量 = `[元素,...]` 不带类型前缀（写 `type:{...}` 报
+  `Expected token of type "["`）；② **sel 可作用于数组**（相位化写回靠它，XLS
+  按元素 lowering）；③ RTL 是 `reg [W] __mem[0:N-1]` 寄存器组；`array_update`
+  是全数组写回（每元素一个 mux，size 大时要另想形态）。
+- 实现：每个 extern 一个数组 state（`reg_<inst>`/`cnt_<inst>`），**不参与相位 0
+  清零**（跨包持久）；写回 = array_update 链 + 相位 sel；Counter.count = 读改写。
+- **真·发现：XLS 把「只写不读」的 state 当死代码优化掉** —— demo5 的 counter
+  在 IR 里全在、codegen 后整个消失。**修法：补观察通道 `ex_<inst>`**
+  （对应 Chisel 线的 `io.ex_`）：valid_data 无背压、无谓词（绝不反压主通路）、
+  元素 0 在最高位、数据取本拍处理后的值。
+  **教训：每条 state 都必须有对外可观测路径，且要在 codegen 之后才能发现这种删除。**
+- 端到端：demo5-pipeline 3/3（extern 跨包累计 1→2→3），四样本回归全绿。
+
 ## 技术结论备忘
 
 ### A0 门禁 ✅ 通过（2026-09-15）
