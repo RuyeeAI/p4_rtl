@@ -227,6 +227,28 @@ p4_rtl 与以下两个仓库同属 `Code-Repos/`，**不是第三方依赖，是
   中文注释密集的脚本极易踩。
 - parser 与 control **尚不能混在同一程序**（A2-5 合并）；`emitProgram` 遇到即报错。
 
+### A2-5a 完成：parser + control 合并到同一条 proc FSM（2026-09-16）
+
+- **`emitParser`/`emitControl` 统一重写成 `emitPipeline`**（没保留两套 —— 三份代码必然漂移）：
+  - **字段级 state 是 parser/control 的共同表示**：`<inst>_<field>`、`<inst>_v`、
+    `md_<member>`。parser 的 extract 本就是按字段切片，control 的 action 本就是
+    局部修改，字段级天然对齐。
+  - **PHV 输出统一**：header 按声明序拼 `(valid, 字段…)` 再拼 meta，先声明者在高位。
+  - **相位编码**：`0..P-1` parser（相位 0 兼收包）→ `ctrlBase..` control
+    （ctrlBase = P>0 ? P : 1）→ `phSend` 发 → 回 0；`accept→ctrlBase`、
+    `reject→phSend`（无独立 accept/reject 相位）。无 parser 时相位 0 专收 PHV，
+    与 A2-4 编码一致（旧样本零迁移）。
+- **端到端**：新样本 `a2-parser-control.p4`（demo3+demo2 合并体）5/5；
+  demo2 5/5、demo3 2/2 回归（demo2 输出 136→137 位，多 valid 位，TB 已同步）。
+- **真 bug：valid=0 的 header 数据跨包残留** —— state 是持久的，FSM 回到起点
+  ≠ 数据回到起点。**修法：相位 0 清所有槽位（含 header 数据）**，让输出确定。
+  教训：每包开始处必须显式重置，否则残留顺着"保持原值"的 sel 链流下去。
+- **TB 坑**：① 连续发包时 `for(... && !vld) @(negedge)` 会在上一轮 vld 未落时
+  立即返回、量到上一包 —— check 要**先等 vld 落再等它起**；
+  ② iverilog 的 `%0s` 对多字节字符串乱码 —— task 标签用 ASCII。
+- **交互命令坑：zsh 不做 word splitting**（`set -- $pair` 不分词）——
+  WorkBuddy 的 Bash 工具跑 zsh，跨 shell 稳妥的写法是**显式函数传参**。
+
 ## 技术结论备忘
 
 ### A0 门禁 ✅ 通过（2026-09-15）

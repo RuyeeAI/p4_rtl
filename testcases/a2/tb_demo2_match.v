@@ -2,7 +2,7 @@
 // demo2-match 的功能验证：control + const 表 → XLS proc
 //
 // ============================ 被验对象 ============================
-// testcases/p4/demo2-match.p4 经 XlsBackend 生成的 out/a2/demo2.v
+// testcases/p4/demo2-match.p4 经 XlsBackend 生成的 out/a2/demo2-match.v
 //
 //   control Ingress(inout headers_t hdr, inout metadata_t meta) {
 //       action set_cls(bit<8> c) { meta.cls = c; meta.normPort = 16w0; }
@@ -15,8 +15,10 @@
 //       apply { cls_table.apply(); }
 //   }
 //
-// ============================ PHV 的位布局（136 位） ============================
-// 字段序 = control 参数展平序（params 按声明序，struct 成员按声明序）：
+// ============================ PHV 的位布局（137 位） ============================
+// A2-5 起统一口径：header 按声明序拼 (valid, 字段…)，再拼 meta（先声明者在高位）。
+// 本程序没有 parser，valid 由输入 PHV 带入：
+//   phv[136]   = hdr.ethernet 的 valid 位
 //   phv[135:88] = hdr.ethernet.dstAddr(48)
 //   phv[87:40]  = hdr.ethernet.srcAddr(48)
 //   phv[39:24]  = hdr.ethernet.etherType(16)
@@ -31,8 +33,8 @@
 // 4. 同一次运行里连发两包，第二包必须同样正确
 //    （验证 phase S+1 发完 → 回 phase 0 的回路）
 //
-// 用法
-//   iverilog -g2012 -o out/a2/tb_demo2.vvp out/a2/demo2.v testcases/a2/tb_demo2_match.v
+// 用法（一键：scripts/a2_verify.sh testcases/p4/demo2-match.p4）
+//   iverilog -g2012 -o out/a2/tb_demo2.vvp out/a2/demo2-match.v testcases/a2/tb_demo2_match.v
 //   vvp out/a2/tb_demo2.vvp
 
 module tb_demo2_match;
@@ -41,10 +43,10 @@ module tb_demo2_match;
   reg rst = 1;
   always #5 clk = ~clk;
 
-  reg  [135:0] phv_in      = 0;
+  reg  [136:0] phv_in      = 0;
   reg          phv_in_vld  = 0;
   reg          phv_out_rdy = 1;   // 下游一直能收
-  wire [135:0] phv_out;
+  wire [136:0] phv_out;
   wire         phv_out_vld;
 
   Ingress_control dut (
@@ -61,49 +63,48 @@ module tb_demo2_match;
 
   localparam [47:0] DST = 48'h0011_2233_4455;
   localparam [47:0] SRC = 48'h6677_8899_aabb;
-  localparam [15:0] ETYPE_IPV4 = 16'h0800;
-  localparam [15:0] ETYPE_IPV6 = 16'h86dd;
+  localparam [15:0] ETYPE_IPV4  = 16'h0800;
+  localparam [15:0] ETYPE_IPV6  = 16'h86dd;
   localparam [15:0] ETYPE_OTHER = 16'h1234;
 
-  // 报文 CLS0/NP0 = 输入侧初值（用于验证 default 时"保持原值"）
+  // 输入侧初值（用于验证 default 时"保持原值"）
   localparam [7:0]  CLS0 = 8'haa;
   localparam [15:0] NP0  = 16'hbbbb;
 
   // ------------------------------------------------------------------
   // 发一包并检查 phv_out
+  //   send_pkt **不等时钟**：调用点就是「该更新 phv_in 的时刻」
   // ------------------------------------------------------------------
-  task run_case(input [15:0] etype,
-                input [7:0]  cls_exp, input [15:0] np_exp,
-                input integer case_id, input [8*40-1:0] label);
-    reg [135:0] pin;
-    reg [135:0] exp_phv;   // 名字不用 expect：它在 -g2012 下是保留字
+  task send_pkt(input [15:0] etype);
+    begin
+      phv_in = {1'b1, DST, SRC, etype, NP0, CLS0};
+      phv_in_vld = 1;
+    end
+  endtask
+
+  // 标签只用 ASCII：iverilog 的 %0s 对多字节字符串会乱码
+  task check(input [7:0] cls_exp, input [15:0] np_exp,
+             input integer case_id, input [8*40-1:0] label);
+    reg [136:0] exp_phv;   // 名字不用 expect：它在 -g2012 下是保留字
     integer i;
     begin
-      pin = {DST, SRC, etype, NP0, CLS0};
-
-      // phase 0 需要 phv_in_vld=1 才推进
-      @(negedge clk); phv_in = pin; phv_in_vld = 1;
-
-      // 等 phv_out_vld（phase 2 = 发送相位）
+      while (phv_out_vld && i < 20) begin @(negedge clk); i = i + 1; end
       for (i = 0; i < 20 && !phv_out_vld; i = i + 1) @(negedge clk);
 
       if (!phv_out_vld) begin
-        $display("  [FAIL] case %0d（%0s）：20 拍内未见 phv_out_vld", case_id, label);
+        $display("  [FAIL] case %0d (%0s): no phv_out_vld within 20 cycles", case_id, label);
         errors = errors + 1;
       end else begin
-        exp_phv = {DST, SRC, etype, np_exp, cls_exp};
+        exp_phv = {1'b1, DST, SRC, phv_in[39:24], np_exp, cls_exp};
         if (phv_out !== exp_phv) begin
-          $display("  [FAIL] case %0d（%0s）：PHV 不符", case_id, label);
-          $display("        得到 = %h", phv_out);
-          $display("        期望 = %h", exp_phv);
+          $display("  [FAIL] case %0d (%0s): PHV mismatch", case_id, label);
+          $display("        got  = %h", phv_out);
+          $display("        want = %h", exp_phv);
           errors = errors + 1;
         end else begin
-          $display("  [ok] case %0d（%0s）：cls=%h normPort=%h", case_id, label, cls_exp, np_exp);
+          $display("  [ok] case %0d (%0s): cls=%h normPort=%h", case_id, label, cls_exp, np_exp);
         end
       end
-
-      phv_in_vld = 0;
-      repeat (2) @(posedge clk);
     end
   endtask
 
@@ -122,37 +123,27 @@ module tb_demo2_match;
     @(negedge clk); rst = 0;
 
     // case 1：命中表项 0（0x0800 → set_cls(7)）
-    run_case(ETYPE_IPV4, 8'h07, 16'h0000, 1, "hit entry0  0x0800");
+    @(negedge clk); send_pkt(ETYPE_IPV4);
+    check(8'h07, 16'h0000, 1, "hit entry0  0x0800");
+    phv_in_vld = 0; repeat (2) @(posedge clk);
+
     // case 2：命中表项 1（0x86dd → set_cls(9)）
-    run_case(ETYPE_IPV6, 8'h09, 16'h0000, 2, "hit entry1  0x86dd");
+    @(negedge clk); send_pkt(ETYPE_IPV6);
+    check(8'h09, 16'h0000, 2, "hit entry1  0x86dd");
+    phv_in_vld = 0; repeat (2) @(posedge clk);
+
     // case 3：都不命中 → default(nop)，cls/normPort 保持输入值
-    run_case(ETYPE_OTHER, CLS0, NP0, 3, "default     nop");
+    @(negedge clk); send_pkt(ETYPE_OTHER);
+    check(CLS0, NP0, 3, "default     nop");
+    phv_in_vld = 0; repeat (2) @(posedge clk);
 
-    // case 4：**不复位**连发两包，验证 phase2 → phase0 的回路
-    $display("---- case 4：连发两包（不复位）----");
-    begin
-      reg [135:0] p1, p2, e1, e2;
-      p1 = {DST, SRC, ETYPE_IPV4, NP0, CLS0};
-      p2 = {DST, SRC, ETYPE_IPV6, NP0, CLS0};
-      e1 = {DST, SRC, ETYPE_IPV4, 16'h0000, 8'h07};
-      e2 = {DST, SRC, ETYPE_IPV6, 16'h0000, 8'h09};
-
-      @(negedge clk); phv_in = p1; phv_in_vld = 1;
-      for (i = 0; i < 20 && !phv_out_vld; i = i + 1) @(negedge clk);
-      if (phv_out !== e1) begin
-        $display("  [FAIL] 第 1 包：得到 %h 期望 %h", phv_out, e1);
-        errors = errors + 1;
-      end else $display("  [ok] 第 1 包（0x0800）");
-
-      @(negedge clk); phv_in = p2;   // vld 保持 1（连续流）
-      for (i = 0; i < 20 && !phv_out_vld; i = i + 1) @(negedge clk);
-      if (phv_out !== e2) begin
-        $display("  [FAIL] 第 2 包：得到 %h 期望 %h", phv_out, e2);
-        errors = errors + 1;
-      end else $display("  [ok] 第 2 包（0x86dd）");
-
-      phv_in_vld = 0;
-    end
+    // case 4/5：**不复位**连发两包，验证 phase S+1 → phase 0 的回路
+    $display("---- case 4/5: two back-to-back packets (no reset) ----");
+    @(negedge clk); send_pkt(ETYPE_IPV4);
+    check(8'h07, 16'h0000, 4, "pkt1 0x0800");
+    send_pkt(ETYPE_IPV6);   // 就在 check 停下的那个 negedge 换包，vld 保持 1
+    check(8'h09, 16'h0000, 5, "pkt2 0x86dd");
+    phv_in_vld = 0;
 
     $display("======================================================");
     if (errors == 0) $display(" 结果：全部通过");

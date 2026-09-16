@@ -7,12 +7,14 @@
 #   scripts/a2_verify.sh <in.p4> <top> [tb.v]  # 全部显式指定
 #
 # 已知样本（自动匹配 top 与 testbench）
-#   demo3-parser.p4  → Top_parser        + testcases/a2/tb_demo3_parser.v
-#   demo2-match.p4   → Ingress_control   + testcases/a2/tb_demo2_match.v
+#   demo3-parser.p4       → Top_parser        + testcases/a2/tb_demo3_parser.v
+#   demo2-match.p4        → Ingress_control   + testcases/a2/tb_demo2_match.v
+#   a2-parser-control.p4  → Ingress_pipeline  + testcases/a2/tb_a2_parser_control.v
 #
 # 验收判据（各 testbench 头部有完整说明）
-#   demo3-parser：0x0800 → 解析 ipv4（两 valid=1）；0x86dd → default(accept)，ipv4 valid=0
-#   demo2-match ：0x0800 → set_cls(7)；0x86dd → set_cls(9)；其他 → default(nop) 保持原值
+#   demo3-parser      ：0x0800 → 解析 ipv4（两 valid=1）；0x86dd → default(accept)，ipv4 valid=0
+#   demo2-match       ：0x0800 → set_cls(7)；0x86dd → set_cls(9)；其他 → default(nop) 保持原值
+#   a2-parser-control ：parser 与 control 接在同一条 FSM 上；valid 不跨包残留
 #
 # 前置
 #   - 已构建 XLS harness：scripts/bootstrap_xls_env.sh
@@ -27,9 +29,10 @@ STEM="$(basename "${P4%.p4}")"
 
 # 样本 → (top, testbench) 默认值；显式参数优先
 case "$STEM" in
-  demo3-parser) DEF_TOP="Top_parser";      DEF_TB="$ROOT/testcases/a2/tb_demo3_parser.v" ;;
-  demo2-match)  DEF_TOP="Ingress_control"; DEF_TB="$ROOT/testcases/a2/tb_demo2_match.v" ;;
-  *)            DEF_TOP="Top";             DEF_TB="" ;;
+  demo3-parser)       DEF_TOP="Top_parser";       DEF_TB="$ROOT/testcases/a2/tb_demo3_parser.v" ;;
+  demo2-match)        DEF_TOP="Ingress_control";  DEF_TB="$ROOT/testcases/a2/tb_demo2_match.v" ;;
+  a2-parser-control)  DEF_TOP="Ingress_pipeline"; DEF_TB="$ROOT/testcases/a2/tb_a2_parser_control.v" ;;
+  *)                  DEF_TOP="Top";              DEF_TB="" ;;
 esac
 
 TOP="${2:-$DEF_TOP}"
