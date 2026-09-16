@@ -33,6 +33,11 @@
   被拒（`Operation not permitted @ apply2files`）。需在沙箱外装。
 - 本机**无 bazel / conda**，因此 XLS 无法构建；有 verilator / iverilog / cmake / ninja / clang。
 - 坑：Scala 注释**可嵌套**，文档注释里出现 `/*`（如写 `out/ir/*.ir`）会导致 `unclosed comment`。
+- 坑：macOS 自带 **bash 3.2**：紧跟 `$VAR` 之后的**全角标点**（如 `（` U+FF08）会被
+  算进变量名 → `unbound variable`（报错信息还乱码，看不出是标点问题）。
+  **脚本里变量一律写 `${VAR}`。**
+- 坑：沙箱里 `sbt` 会因清理 `~/.sbt/**/classes.bak` 产生**非零退出码**（非编译失败）。
+  脚本判产物存在（`[ -s "$OUT" ]`）而不是判 sbt 退出码。
 
 ## 第三方依赖拉取规范
 
@@ -195,6 +200,32 @@ p4_rtl 与以下两个仓库同属 `Code-Repos/`，**不是第三方依赖，是
 - **新坑 2：`expect` 是 iverilog `-g2012` 的保留字**（SV 断言关键字），
   用作 TB 变量名会报指向声明行的莫名语法错。
 - 范围：XlsBackend 第一版**只有 parser**；control 尚未支持（下一步 A2-4）。
+
+### A2-4 完成：control + const 表 → proc 端到端跑通（2026-09-16）
+
+- **`XlsBackend.emitControl`**：control → proc。
+  - **字段级 state**（`<param>_<member>[_<field>]`），不是 header 级 —— action 是
+    局部修改（`meta.cls = c`），字段级让「改哪个就更新哪个」最直接。
+  - 相位：`0` 收 PHV → `1..S` apply 体每条语句一拍 → `S+1` 发 PHV → 回 0。
+  - PHV 布局 = control 参数展平序（先声明者在高位，与 `concat` 左=MSB 一致）。
+  - const 表**编译期内联**：逐表项算 `hit_i`（逐 key 元素比较后 `and`，与整体
+    concat 比较等价），表项输出作候选值再按**声明序优先**倒序嵌套 `sel`；
+    default 表项输出作基线（优先级最低）。
+  - 每条语句一个相位，相位互斥 ⇒ 字段 next 值 = 逐相位 `sel` 链，
+    天然实现「后写的覆盖先写的」。
+- **决策修正：action 不用 `fn` + invoke，改为内联进 proc**（见 docs §3.4）。
+  理由：单 proc 无复用收益（XLS 对 invoke 本就内联展开），而 fn 形参/返回值
+  如何对接 proc 的 state **尚未验证**；内联让 `Ir.InputRef` 直接落到 state 读节点。
+  内联仍**复用** `IrBuilder.ExprLowering`（宽度推断/位宽 fit/运算符一份实现）
+  + `Passes.runAll`，逐节点映射到 `XlsProc.Builder`（与 `IrText.dump` 同一张表）。
+- **端到端**：`scripts/a2_verify.sh <in.p4>`（样本名自动选 top/testbench）
+  - demo2-match 4/4：0x0800→`set_cls(7)`；0x86dd→`set_cls(9)`；其他→`default(nop)`
+    保持原值；**连发两包**都正确（验证 phase S+1 → 0 的回路）
+  - demo3-parser 2/2 回归通过
+- **新坑：macOS bash 3.2 把紧跟 `$VAR` 的**全角标点**算进变量名**
+  → `unbound variable`，错误信息还乱码。修法：变量一律写 `${VAR}`。
+  中文注释密集的脚本极易踩。
+- parser 与 control **尚不能混在同一程序**（A2-5 合并）；`emitProgram` 遇到即报错。
 
 ## 技术结论备忘
 

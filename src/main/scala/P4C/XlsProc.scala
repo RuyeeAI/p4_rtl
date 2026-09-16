@@ -208,6 +208,26 @@ object XlsProc {
       nm
     }
 
+    /** `zero_ext`：零扩展。XLS 无独立 trunc op，截断一律用 [[bitSlice]]。 */
+    def zeroExt(src: String, newWidth: Int, hint: String = "zext"): String = {
+      val (nm, id) = fresh(hint, s"bits[$newWidth]")
+      emit(s"$nm: bits[$newWidth] = zero_ext(${check(src)}, new_bit_count=$newWidth, id=$id)")
+      nm
+    }
+
+    /** `not`（按位取反）。
+      *
+      * 与 [[IrText]] 的发射口径一致：**不带 `id=` 参数**（IrText 的全部节点都不带 id，
+      * 其产物已过官方 parser + codegen 验证）。名字仍用 id 后缀保证唯一 ——
+      * 这里消耗一个 id 只是为了让节点名不撞车，不影响 IR 语义。 */
+    def notNode(src: String, width: Int, hint: String = "not"): String = {
+      val id = ids.next()
+      val nm = s"${hint}_$id"
+      defined(nm) = s"bits[$width]"
+      emit(s"$nm: bits[$width] = not(${check(src)})")
+      nm
+    }
+
     /** `send`。返回新的 token 节点名。 */
     def send(tok: String, data: String, chan: String, predicate: Option[String] = None,
              hint: String = "snd"): String = {
