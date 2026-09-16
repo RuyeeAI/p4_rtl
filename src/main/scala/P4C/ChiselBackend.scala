@@ -1076,12 +1076,17 @@ object ChiselBackend {
   // FSM Module，不参与 Scheduler 切拍；指示仅在解析层记录并打日志，语义由
   // 未来"parser 流水化"设计承接。
 
-  private final case class StateLayout(
+  /** 一个 parser 状态的布局：本状态要 extract 的 header（含字节偏移）+ 转移语句。
+    *
+    * 可见性从 `private` 放宽到 `private[P4C]`（2026-09-16）：[[XlsBackend]] 需要
+    * 复用同一套偏移计算，避免两份实现漂移。放宽可见性不改变任何行为，
+    * Chisel 线不受影响。 */
+  private[P4C] final case class StateLayout(
     extracts: Seq[(Seq[String], HeaderType, Int)], // 路径, header 类型, 字节偏移
     trans: TransStmt,
   )
 
-  private def layoutParser(p: ParserDecl, prog: P4Program): Map[String, StateLayout] = {
+  private[P4C] def layoutParser(p: ParserDecl, prog: P4Program): Map[String, StateLayout] = {
     val headerTypes = prog.headerTypes.map(ht => ht.name -> ht).toMap
     val states = p.states.map(s => s.name -> s).toMap
     val layouts = mutable.HashMap.empty[String, StateLayout]

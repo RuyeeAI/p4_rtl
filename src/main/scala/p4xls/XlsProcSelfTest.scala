@@ -56,10 +56,10 @@ object XlsProcSelfTest {
     val nWait = b.literal(1, "bits[2]", "n_wait")
     val nDisp = b.literal(2, "bits[2]", "n_disp")
     val nIdle = b.literal(0, "bits[2]", "n_idle")
-    val nextPhase = b.sel(ph, Seq(nWait, nDisp, nIdle), nIdle, "bits[2]", "next_phase")
+    val nextPhase = b.sel(ph, Seq(nWait, nDisp, nIdle), Some(nIdle), "bits[2]", "next_phase")
 
     // ---- 保存 response（只在 WAIT 拍采样）----
-    val nextHold = b.sel(ph, Seq(hold, rsp, hold), hold, "bits[32]", "next_hold")
+    val nextHold = b.sel(ph, Seq(hold, rsp, hold), Some(hold), "bits[32]", "next_hold")
 
     // ---- token 汇聚 + 写回 ----
     val tokAll = b.afterAll(Seq(sKey, tokR, sOut), "next_tok")

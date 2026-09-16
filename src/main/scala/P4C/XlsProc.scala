@@ -63,6 +63,9 @@ object XlsProc {
     def peek: Int = nextId
   }
 
+  /** 从类型字符串里取 `bits[N]` 的 N（[[Builder.sel]] 判断 cases 是否全覆盖用）。 */
+  private val BitsWidthRe = """bits\[(\d+)\]""".r
+
   /** proc 头的一条通道声明（同时决定端口与 `chan_interface` 行）。 */
   final case class ChanDecl(name: String, direction: String, flowControl: String, width: Int)
 
@@ -79,7 +82,11 @@ object XlsProc {
     private val chans = mutable.ArrayBuffer.empty[ChanDecl]
     private val states = mutable.ArrayBuffer.empty[StateDecl]
     private val body = mutable.ArrayBuffer.empty[String]
-    private val defined = mutable.LinkedHashSet.empty[String]
+    /** 已发射的节点：名字 → 类型字符串。
+      *
+      * 类型用于 [[sel]] 自动判断「cases 是否已覆盖 selector 的全部取值」——
+      * XLS 不允许这种情况下出现 default（见 sel 的注释）。 */
+    private val defined = mutable.LinkedHashMap.empty[String, String]
 
     // ---------------- 声明 ----------------
 
@@ -108,10 +115,10 @@ object XlsProc {
 
     private def emit(line: String): Unit = body += ("  " + line)
 
-    private def fresh(hint: String): (String, Int) = {
+    private def fresh(hint: String, ty: String): (String, Int) = {
       val id = ids.next()
       val nm = s"${hint}_$id"
-      defined += nm
+      defined(nm) = ty
       (nm, id)
     }
 
@@ -130,21 +137,21 @@ object XlsProc {
 
     /** `state_read`。返回节点名。 */
     def stateRead(elem: String, ty: String, hint: String = "sr"): String = {
-      val (nm, id) = fresh(hint)
+      val (nm, id) = fresh(hint, ty)
       emit(s"$nm: $ty = state_read(state_element=$elem, id=$id)")
       nm
     }
 
     /** `literal`。`ty` 形如 `bits[32]`。 */
     def literal(value: BigInt, ty: String, hint: String = "lit"): String = {
-      val (nm, id) = fresh(hint)
+      val (nm, id) = fresh(hint, ty)
       emit(s"$nm: $ty = literal(value=$value, id=$id)")
       nm
     }
 
     /** 二元运算（add/sub/and/or/xor/shll/shrl/eq/ne/ult/ule/ugt/uge）。 */
     def binOp(op: String, l: String, r: String, ty: String, hint: String = "bin"): String = {
-      val (nm, id) = fresh(hint)
+      val (nm, id) = fresh(hint, ty)
       emit(s"$nm: $ty = $op(${check(l)}, ${check(r)}, id=$id)")
       nm
     }
@@ -155,32 +162,48 @@ object XlsProc {
 
     /** `tuple_index`。 */
     def tupleIndex(t: String, index: Int, ty: String, hint: String = "ti"): String = {
-      val (nm, id) = fresh(hint)
+      val (nm, id) = fresh(hint, ty)
       emit(s"$nm: $ty = tuple_index(${check(t)}, index=$index, id=$id)")
       nm
     }
 
-    /** `sel`。注意 XLS 语义：`cases` 按 selector 的**取值**索引，
-      * `cases(i)` 即 `selector == i` 时的结果；超出范围取 `default`。
-      * 所有元素必须是已定义的节点引用（不能写字面量）。 */
-    def sel(selector: String, cases: Seq[String], default: String, ty: String,
+    /** `sel`。注意 XLS 的语义与一条硬规则：
+      *
+      * - `cases` 按 selector 的**取值**索引：`cases(i)` 即 `selector == i` 时的结果；
+      * - 所有元素必须是已定义的节点引用（不能写字面量）；
+      * - ⚠️ '''当 `cases` 数量 = `2^selector位宽` 时不允许给 default'''
+      *   —— 报 `Select has useless default value: selector has N bits with M cases`。
+      *   典型场景：`bits[1]` 的谓词选择器 + 2 个 cases（真假两臂）已全覆盖。
+      *   所以 `default` 是 `Option`。
+      */
+    def sel(selector: String, cases: Seq[String], default: Option[String], ty: String,
             hint: String = "sel"): String = {
-      val (nm, id) = fresh(hint)
+      val (nm, id) = fresh(hint, ty)
       val cs = cases.map(check).mkString(", ")
-      emit(s"$nm: $ty = sel(${check(selector)}, cases=[$cs], default=${check(default)}, id=$id)")
+      // XLS 硬规则：**当 cases 覆盖了 selector 的全部取值时不允许有 default**
+      // （报 `Select has useless default value: selector has N bits with M cases`）。
+      // 这里按 selector 的位宽**自动判断并省略**，调用方不必关心这条规则 ——
+      // 实测中 12 处 sel 里有 6 处踩了这个坑（凡以 bits[1] 谓词为 selector 的
+      // 「旧值/新值」二选一，都是 2^1 = 2 个 case）。
+      val coversAll = defined.get(selector).exists {
+        case BitsWidthRe(n) => cases.size == (1 << n.toInt)
+        case _ => false
+      }
+      val d = if (coversAll) "" else default.map(x => s", default=${check(x)}").getOrElse("")
+      emit(s"$nm: $ty = sel(${check(selector)}, cases=[$cs]$d, id=$id)")
       nm
     }
 
     /** `concat`（左 = MSB，与 XLS 一致）。 */
     def concat(parts: Seq[String], ty: String, hint: String = "cat"): String = {
-      val (nm, id) = fresh(hint)
+      val (nm, id) = fresh(hint, ty)
       emit(s"$nm: $ty = concat(${parts.map(check).mkString(", ")}, id=$id)")
       nm
     }
 
     /** `bit_slice`。 */
     def bitSlice(src: String, start: Int, width: Int, hint: String = "slc"): String = {
-      val (nm, id) = fresh(hint)
+      val (nm, id) = fresh(hint, s"bits[$width]")
       emit(s"$nm: bits[$width] = bit_slice(${check(src)}, start=$start, width=$width, id=$id)")
       nm
     }
@@ -189,7 +212,7 @@ object XlsProc {
     def send(tok: String, data: String, chan: String, predicate: Option[String] = None,
              hint: String = "snd"): String = {
       needChan(chan, "send")
-      val (nm, id) = fresh(hint)
+      val (nm, id) = fresh(hint, "token")
       val p = predicate.map(x => s", predicate=${check(x)}").getOrElse("")
       emit(s"$nm: token = send(${check(tok)}, ${check(data)}$p, channel=$chan, id=$id)")
       nm
@@ -201,7 +224,7 @@ object XlsProc {
     def receive(tok: String, chan: String, dataTy: String, predicate: Option[String] = None,
                 hint: String = "rcv"): (String, String) = {
       needChan(chan, "receive")
-      val (nm, id) = fresh(hint)
+      val (nm, id) = fresh(hint, s"(token, $dataTy)")
       val p = predicate.map(x => s", predicate=${check(x)}").getOrElse("")
       emit(s"$nm: (token, $dataTy) = receive(${check(tok)}$p, channel=$chan, id=$id)")
       val t = tupleIndex(nm, 0, "token", s"${hint}_tok")
@@ -215,7 +238,7 @@ object XlsProc {
       * 返回类型，**不加 token**。若被调函数接受 token 形参（官方样本里那类
       * `__itok__` 前缀函数），写法是 `(token, T) = invoke(tok, args...)`。 */
     def invoke(fnName: String, args: Seq[String], retTy: String, hint: String = "inv"): String = {
-      val (nm, id) = fresh(hint)
+      val (nm, id) = fresh(hint, retTy)
       emit(s"$nm: $retTy = invoke(${args.map(check).mkString(", ")}, to_apply=$fnName, id=$id)")
       nm
     }
@@ -223,7 +246,7 @@ object XlsProc {
     /** `invoke` 一个**带 token 形参**的 fn，返回 `(token, 返回值)` 两个节点名。 */
     def invokeWithTok(fnName: String, tok: String, args: Seq[String], retTy: String,
                       hint: String = "invt"): (String, String) = {
-      val (nm, id) = fresh(hint)
+      val (nm, id) = fresh(hint, s"(token, $retTy)")
       emit(s"$nm: (token, $retTy) = invoke(${check(tok)}, ${args.map(check).mkString(", ")}, " +
         s"to_apply=$fnName, id=$id)")
       val t = tupleIndex(nm, 0, "token", s"${hint}_tok")
@@ -234,7 +257,7 @@ object XlsProc {
     /** `after_all`。注意：XLS 要求至少 1 个操作数，且都是 token。 */
     def afterAll(toks: Seq[String], hint: String = "aa"): String = {
       require(toks.nonEmpty, "XlsProc.afterAll：至少需要一个操作数")
-      val (nm, id) = fresh(hint)
+      val (nm, id) = fresh(hint, "token")
       emit(s"$nm: token = after_all(${toks.map(check).mkString(", ")}, id=$id)")
       nm
     }
