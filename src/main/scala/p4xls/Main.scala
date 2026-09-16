@@ -11,6 +11,8 @@ import java.nio.file.{Files, Paths}
   *   xls <in> <out>   '''XLS 线'''：P4 → XLS IR 文本（proc 编排，见 P4C.XlsBackend）；
   *                    IR → Verilog → 仿真由 scripts/a2_verify.sh 串（依赖外部
   *                    XLS codegen 驱动与 iverilog，不进本 CLI）
+  *   wrap-chisel      把 XLS 生成的 Verilog 封装成 Chisel BlackBox + Shell
+  *                    （路线 3：产物原样集成进下游 Chisel 工程）
   *   lint-ir <files>  XLS IR 文本静态校验（委托 scripts/xls_ir_lint.py）
   *   version          版本信息
   *
@@ -28,7 +30,8 @@ object Main {
   def run(args: Array[String]): Int = args.toList match {
     case "p4c" :: rest     => P4C.P4cCli.run(rest.toArray)
     case "xls" :: rest     => runXls(rest.toArray)
-    case "lint-ir" :: rest => runLintIr(rest.toArray)
+    case "wrap-chisel" :: rest => runWrappedPy("wrap-chisel", "scripts/gen_chisel_wrapper.py", rest.toArray)
+    case "lint-ir" :: rest => runWrappedPy("lint-ir", "scripts/xls_ir_lint.py", rest.toArray)
     case "version" :: _    => println(s"p4xls $Version  (P4 -> XLS IR -> RTL)"); 0
     case Nil | "-h" :: _ | "--help" :: _ | "help" :: _ => usage(); 0
     case other :: _ =>
@@ -72,14 +75,15 @@ object Main {
     if (stem.headOption.exists(_.isDigit)) "_" + stem else stem
   }
 
-  private def runLintIr(args: Array[String]): Int = {
-    if (args.isEmpty) {
+  /** 委托给 Python 脚本的子命令（lint-ir / wrap-chisel 同模式）。 */
+  private def runWrappedPy(name: String, scriptPath: String, args: Array[String]): Int = {
+    if (name == "lint-ir" && args.isEmpty) {
       System.err.println("lint-ir 需要至少一个 .ir 文件或目录参数")
       return 2
     }
-    val script = new java.io.File("scripts/xls_ir_lint.py")
+    val script = new java.io.File(scriptPath)
     if (!script.exists()) {
-      System.err.println(s"未找到 ${script.getPath}（请在工程根目录运行，或用 --scripts 指定）")
+      System.err.println(s"未找到 ${script.getPath}（请在工程根目录运行）")
       return 2
     }
     val py = sys.env.getOrElse("P4XLS_PYTHON", "python3")
@@ -97,12 +101,16 @@ object Main {
          |  xls <in.p4> <out.ir>
          |                    XLS 线：P4 → XLS IR 文本（proc 编排；
          |                    IR → Verilog → 仿真见 scripts/a2_verify.sh）
+         |  wrap-chisel -o <dir> <verilog...>
+         |                    把 XLS 生成的 Verilog 封装成 Chisel BlackBox + Shell
+         |                    （产物集成进下游 Chisel 工程；用法见脚本头注释）
          |  lint-ir <files>   XLS IR 文本静态校验
          |  version           版本
          |
          |示例:
          |  p4xls p4c gen testcases/p4/demo9-l3forwarder.p4 --dump-ir out/ir
          |  p4xls xls testcases/p4/demo9-l3forwarder.p4 out/a2/demo9.ir
+         |  p4xls wrap-chisel -o out/a2/chisel out/a2/*.v
          |  p4xls lint-ir out/ir
          |""".stripMargin
     )
