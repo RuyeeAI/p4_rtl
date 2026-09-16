@@ -62,8 +62,7 @@ echo
 echo "========== 1/4 P4 → XLS IR =========="
 # 判「产物」而非 sbt 退出码：sbt 会因清理 ~/.sbt 下的 .bak 缓存产生非零退出
 # （沙箱里必现），那不是编译失败。
-sbt -batch "runMain p4xls.XlsBackendSelfTest $P4 $IR" 2>&1 \
-  | grep -E "✅|^\[error\]" | head -20 || true
+scripts/p4xls xls "$P4" "$IR" 2>&1 | grep -E "✅|error" | head -20 || true
 [ -s "$IR" ] || { echo "❌ IR 未生成：$IR" >&2; exit 1; }
 
 echo

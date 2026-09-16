@@ -280,6 +280,16 @@ p4_rtl 与以下两个仓库同属 `Code-Repos/`，**不是第三方依赖，是
 - 端到端：demo7 4/4、demo9 2/2（flowHash/swapId 逐位核对），**六样本 21 case 全绿**。
   A2 功能面已齐：parser + control + const/runtime 表 + Register/Counter。
 
+### A2-6 完成：CLI 收口 ✅（2026-09-16）—— A2 全部完成
+
+- `p4xls xls <in.p4> <out.ir>` 收进 `Main.scala`（v0.2.0），`XlsBackendSelfTest` 删除；
+  `a2_verify.sh` 改用 `scripts/p4xls xls`（sbt 启动 ~5s → ~0.3s）。
+- **迁移临时入口的口径坑**：pkgOf 传了相对路径 → package 名变
+  `testcases_p4_demo2_match`（应为文件名主干 `demo2_match`）——
+  **迁移入口时逐参数核对口径，编译器不提醒**。
+- 进度文档更新：A2/A4 ✅、A3 🟡（剩外部表模块 EM/LPM/TCAM + 表写接口）、遗留 #8 关闭。
+- 下一步排序：① 外部表模块（A3 剩余）② A5 对拍 ③ 前端改动回灌 ../P4C。
+
 ## 技术结论备忘
 
 ### A0 门禁 ✅ 通过（2026-09-15）
