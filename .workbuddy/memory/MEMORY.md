@@ -180,6 +180,22 @@ p4_rtl 与以下两个仓库同属 `Code-Repos/`，**不是第三方依赖，是
   而非 demo5（带 Register/Counter，extern 状态存放方式尚未验证）。
 - 详见 `docs/A2-架构设计.md`。
 
+### A2-2/A2-3 完成：parser → proc 端到端跑通（2026-09-16）
+
+- **`XlsBackend`**：P4 parser → XLS proc。每个 header 一对 state
+  （`h_<inst>` 数据 + `v_<inst>` valid），不拼大 PHV；相位 0..N-1 = parser
+  状态、N = accept、N+1 = reject（处理完回 0 重新收包）；select 用倒序嵌套 `sel`。
+- **复用** `ChiselBackend.layoutParser` 的字节偏移计算（可见性放宽到 `private[P4C]`，
+  不改变行为）。**原则：同一套语义只写一份实现。**
+- **端到端**：`scripts/a2_parser_verify.sh`（P4 → IR → Verilog → iverilog）
+  demo3-parser 两个 case 全过，含 select 两个分支。
+- **新坑 1：`sel` 的 default 规则** —— cases 覆盖 selector 全部取值时不许有 default。
+  修法是**让工具承担**：Builder 记录节点类型，按 selector 位宽自动省略。
+  不要在每个调用点手工判断（12 处里有 6 处会踩）。
+- **新坑 2：`expect` 是 iverilog `-g2012` 的保留字**（SV 断言关键字），
+  用作 TB 变量名会报指向声明行的莫名语法错。
+- 范围：XlsBackend 第一版**只有 parser**；control 尚未支持（下一步 A2-4）。
+
 ## 技术结论备忘
 
 ### A0 门禁 ✅ 通过（2026-09-15）
