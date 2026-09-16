@@ -265,6 +265,21 @@ p4_rtl 与以下两个仓库同属 `Code-Repos/`，**不是第三方依赖，是
   **教训：每条 state 都必须有对外可观测路径，且要在 codegen 之后才能发现这种删除。**
 - 端到端：demo5-pipeline 3/3（extern 跨包累计 1→2→3），四样本回归全绿。
 
+### A2-5c 完成：runtime 表 + demo9 全特性端到端（2026-09-16）
+
+- **架构定案：proc 是查表客户端** —— 表存储与匹配在外部表模块（M0 已验证的
+  key→rsp 契约），接口 `tbl_<名>_key`(send) + `tbl_<名>_rsp`(receive，
+  布局 `hit|actId|args`，hit 最高位，proc 不回传 key）。
+- **2 拍：发 key → 收 rsp 并同拍应用 action**。⚠️ 不能放下一拍：stages=2 流水化
+  把相邻相位判据寄存器化（p0_is_phX）**永远错开一拍**，而 receive 数据只在
+  p0_is_phRsp 拍有效（其余拍被门控清零）—— 错拍应用时数据已没了。
+- **parser select 的顶层 const（W0）零改动**：Parser 解析期就按名替换成带宽字面量。
+- **两个真 bug**：① 上述错拍；② **extern 写必须带 hit 谓词门控** ——
+  array_update 是「效果」不是数据，PHV 字段靠数据 sel 选择的方式对它无效，
+  miss 条目的写会照样生效；default 表项谓词 = ~anyHit。
+- 端到端：demo7 4/4、demo9 2/2（flowHash/swapId 逐位核对），**六样本 21 case 全绿**。
+  A2 功能面已齐：parser + control + const/runtime 表 + Register/Counter。
+
 ## 技术结论备忘
 
 ### A0 门禁 ✅ 通过（2026-09-15）

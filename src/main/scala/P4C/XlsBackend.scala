@@ -84,16 +84,19 @@ object XlsBackend {
   /** extern（Register/Counter）与 proc 的对接钩子：由 [[emitPipeline]] 按当前相位构造。
     *
     * - `read`：inst 的元素读（array_index）；
-    * - `write`：inst 的元素写（array_update 链 + 相位 sel，最后写胜出）。
+    * - `write`：inst 的元素写（array_update 链，最后写胜出）。
+    *   `pred` 是**额外谓词**（如 const 表条目的 hit）—— array_update 是「效果」
+    *   而非数据，无法像 PHV 字段那样靠数据 sel 选择，**必须谓词门控**，否则
+    *   未命中条目的写也会生效（demo9 首跑踩过：miss 条目的累加照样发生）。
     * 索引/值都已发射成 proc 节点名。 */
   private final case class ExternHooks(
     read: (String, String) => String,
-    write: (String, String, String) => Unit,
+    write: (String, String, String, Option[String]) => Unit,
   )
 
   private val NoExtern = ExternHooks(
     (inst, _) => throw new P4Error(s"XlsBackend：读了未声明的 extern '$inst'"),
-    (inst, _, _) => throw new P4Error(s"XlsBackend：写了未声明的 extern '$inst'"),
+    (inst, _, _, _) => throw new P4Error(s"XlsBackend：写了未声明的 extern '$inst'"),
   )
 
   /** 把一个 [[Ir.Dag]] **内联发射**进 proc。
@@ -108,7 +111,7 @@ object XlsBackend {
     */
   private def emitDagInto(
     b: Builder, dag: Ir.Dag, inputOf: Seq[String] => String, hint: String,
-    ext: ExternHooks = NoExtern,
+    ext: ExternHooks = NoExtern, pred: Option[String] = None,
   ): Map[Seq[String], String] = {
     val emitted = mutable.HashMap.empty[Ir.NodeId, String]
     // 深度优先：先发操作数再发自身，天然满足 XLS「引用先于定义」
@@ -131,12 +134,12 @@ object XlsBackend {
     })
     dag.outputs.foreach {
       case Ir.OutputWrite(_, v, _) => go(v)
-      // extern 写：RegWrite 直接写值；CounterAdd 读改写（旧值 + delta）
-      case Ir.RegWrite(inst, idx, v, _, _) => ext.write(inst, go(idx), go(v))
+      // extern 写：RegWrite 直接写值；CounterAdd 读改写（旧值 + delta）。谓词透传。
+      case Ir.RegWrite(inst, idx, v, _, _) => ext.write(inst, go(idx), go(v), pred)
       case Ir.CounterAdd(inst, idx, delta, w, _) =>
         val cur = ext.read(inst, go(idx))
         val inc = b.binOp("add", cur, go(delta), bitsTy(w), s"${hint}_cnt")
-        ext.write(inst, go(idx), inc)
+        ext.write(inst, go(idx), inc, pred)
       case s => throw new P4Error(s"XlsBackend：proc 内暂不支持 $s 汇点")
     }
     dag.outputs.collect { case Ir.OutputWrite(path, v, _) => path -> go(v) }.toMap
@@ -161,6 +164,26 @@ object XlsBackend {
     val outs = a.body.map {
       case asg: Assign => lowering.lowerAssign(asg.path, asg.expr, binds)
       // extern 方法调用：Register.write / Counter.count（read 是表达式侧，走 lower）
+      case mc: MethodCall => lowering.lowerMethodCall(mc, binds)
+      case st => throw new P4Error(
+        s"行 ${st.line}：XlsBackend 的 action 体暂只支持赋值与 extern 方法调用")
+    }
+    Passes.runAll(ib.finish(outs))
+  }
+
+  /** action body → Dag，形参用**伪路径** `$arg.<name>`（[[emitDagInto]] 的 inputOf
+    * 负责映射到 proc 域节点）—— runtime 表的形参来自 rsp 位段切片，不是 AST 常量。 */
+  private def actionDagArgNodes(
+    a: ActionDecl, resolver: IrBuilder.WidthResolver, externs: Map[String, ExternInst],
+  ): Ir.Dag = {
+    val ib = new Ir.Builder
+    val lowering = new IrBuilder.ExprLowering(resolver, ib, externs)
+    val binds: IrBuilder.Bindings = a.params.map { p =>
+      val id = ib.add(Ir.InputRef(Seq("$arg", p.name), p.width))
+      p.name -> ((id, p.width))
+    }.toMap
+    val outs = a.body.map {
+      case asg: Assign => lowering.lowerAssign(asg.path, asg.expr, binds)
       case mc: MethodCall => lowering.lowerMethodCall(mc, binds)
       case st => throw new P4Error(
         s"行 ${st.line}：XlsBackend 的 action 体暂只支持赋值与 extern 方法调用")
@@ -263,10 +286,50 @@ object XlsBackend {
     val hasParser = parserOpt.isDefined
     val ctrlBase = if (pCount > 0) pCount else 1
     val stmts = ctrlOpt.map(_.applyBody).getOrElse(Seq.empty)
-    val phSend = ctrlBase + stmts.length
+    // 相位占用：**runtime 表 2 拍**（发 key；收 rsp 并同拍应用 action），其余语句 1 拍。
+    // ⚠️ 不能把「应用 action」放到收 rsp 的下一拍：stages=2 流水化会把相邻相位的
+    // 判据寄存器化（p0_is_phX），永远互相错开一拍 —— 而 receive 的数据只在
+    // p0_is_phRsp 拍有效（其余拍被门控清零），下一拍应用时数据已经没了。
+    // 应用是纯组合 sel，与接收同拍毫无问题。
+    val rtNames = ctrlOpt.toSeq.flatMap(_.tables).filter(_.isRuntime).map(_.name).toSet
+    val stmtLens: Seq[Int] = stmts.map {
+      case TableApply(n, _) => if (rtNames.contains(n)) 2 else 1
+      case _ => 1
+    }
+    val stmtBase: Seq[Int] = stmtLens.scanLeft(0)(_ + _)
+    val ctrlSpan = stmtLens.sum
+    val phSend = ctrlBase + ctrlSpan
     val nPhases = phSend + 1
     val pw = widthFor(nPhases)
     val phaseOf: Map[String, Int] = mainStates.zipWithIndex.toMap
+
+    // ---- 5b) runtime 表的接口布局。存储与匹配都在**外部表模块**（M0 已验证
+    // send key → 等 rsp 的时序契约；A4：key/rsp 都走 valid_data 无背压）；
+    // proc 只是查表客户端。rsp 布局（自定，与 Chisel 线的条目布局不同 ——
+    // proc 不回传 key，由表模块自行比对）：hit(1) | actId(actW) | args(argW)。
+    case class RtLayout(name: String, keyBits: Int, actW: Int, argW: Int,
+                        argOffsets: Map[String, Seq[(String, Int, Int)]])
+    val rtLayouts: Map[String, RtLayout] = ctrlOpt.toSeq.flatMap { c =>
+      val actByName = c.actions.map(a => a.name -> a).toMap
+      c.tables.filter(_.isRuntime).map { t =>
+        val acts = t.actions.map { n => actByName.getOrElse(n,
+          throw new P4Error(s"table '${t.name}'：引用了未知 action '$n'")) }
+        val actW = math.max(1, BigInt(math.max(0, acts.size - 1)).bitLength)
+        val argW = acts.map(a => a.params.map(_.width).sum).foldLeft(0)(math.max)
+        val argOffsets = acts.map { a =>
+          // 第 j 个形参的 LSB 偏移 = 其后所有形参宽度之和（先声明者占高位，与 Chisel 线同口径）
+          a.name -> a.params.zipWithIndex.map { case (p, j) =>
+            (p.name, a.params.drop(j + 1).map(_.width).sum, p.width)
+          }
+        }.toMap
+        val keyBits = t.keys.map { ke => ke.expr match {
+          case Name(p, _) => slotForPath(p, ke.line).width
+          case other => throw new P4Error(
+            s"行 ${ke.line}：runtime 表 key 只支持字段路径（got ${other.getClass.getSimpleName}）")
+        } }.sum
+        RtLayout(t.name, keyBits, actW, argW, argOffsets)
+      }.map(rl => rl.name -> rl)
+    }.toMap
 
     // ---- 6) 声明 ----
     val procName = (parserOpt, ctrlOpt) match {
@@ -310,6 +373,12 @@ object XlsBackend {
     // 布局：元素 0 在最高位（与 PHV「先声明者在高位」同原则）。
     extStates.foreach(es =>
       b.declareChan(s"ex_${es.inst}", "send", es.width * es.size, "valid_data"))
+
+    // runtime 表的通道对（A4：key/rsp 都走 valid_data，无背压）
+    rtLayouts.values.foreach { rl =>
+      b.declareChan(s"tbl_${rl.name}_key", "send", rl.keyBits, "valid_data")
+      b.declareChan(s"tbl_${rl.name}_rsp", "receive", 1 + rl.actW + rl.argW, "valid_data")
+    }
 
     // ---- 7) 读状态 + 相位判据 ----
     val tok = b.stateRead("tok", "token", "tok")
@@ -424,7 +493,8 @@ object XlsBackend {
           s"XlsBackend：内部错误 —— 路径 '${path.mkString(".")}' 无对应的 state 读"))
 
       stmts.zipWithIndex.foreach { case (stmt, k) =>
-        val phK = isPh(ctrlBase + k)
+        // 本语句的起始相位（runtime 表占 3 拍，见 stmtBase）
+        val phK = isPh(ctrlBase + stmtBase(k))
         val tag = s"ns$k"
 
         /** extern 与 proc 的对接（每个语句相位重建一次，捕获本相位的谓词）：
@@ -434,12 +504,18 @@ object XlsBackend {
           val es = extByName.getOrElse(inst, throw new P4Error(s"XlsBackend：未声明的 extern '$inst'"))
           b.arrayIndex(extCur(inst), idxNode, bitsTy(es.width), s"ar_${es.name}")
         }
-        def extWrite(inst: String, idxNode: String, valNode: String): Unit = {
+        /** extern 写：谓词 = 相位（& 附加条件如表项 hit）。同拍多次写链式后写胜出。 */
+        def extWrite(inst: String, idxNode: String, valNode: String,
+                     extra: Option[String] = None): Unit = {
           val es = extByName.getOrElse(inst, throw new P4Error(s"XlsBackend：未声明的 extern '$inst'"))
           val arrTy = s"bits[${es.width}][${es.size}]"
           val prev = extNext(inst)
           val upd = b.arrayUpdate(prev, valNode, idxNode, arrTy, s"au_${tag}_$inst")
-          extNext(inst) = b.sel(phK, Seq(prev, upd), Some(prev), arrTy, s"ne_${tag}_$inst")
+          val pred = extra match {
+            case Some(p) => b.binOp("and", phK, p, "bits[1]", s"wp_${tag}_$inst")
+            case None => phK
+          }
+          extNext(inst) = b.sel(pred, Seq(prev, upd), Some(prev), arrTy, s"ne_${tag}_$inst")
         }
         val ext = ExternHooks(extRead, extWrite)
 
@@ -456,8 +532,82 @@ object XlsBackend {
 
           case TableApply(name, ln) =>
             val t = tableOf.getOrElse(name, throw new P4Error(s"行 $ln：未知 table '$name'"))
-            if (t.isRuntime) throw new P4Error(
-              s"行 $ln：运行时表 '${name}' 需要 key_out/rsp_in 通道（暂不支持，见架构文档 §5）")
+            if (t.isRuntime) {
+              // ================= runtime 表：2 拍 =================
+              // 拍1 发 key；拍2 收 rsp 并**同拍**应用 action（见 stmtLens 处的说明）。
+              // 存储与匹配在外部表模块。
+              val rl = rtLayouts.getOrElse(name, throw new P4Error(
+                s"行 $ln：内部错误 —— runtime 表 '$name' 无接口布局"))
+              val base = ctrlBase + stmtBase(k)
+              val phKey = isPh(base)
+              val phRsp = isPh(base + 1)   // 收 rsp + 应用 action（同一拍）
+
+              // key：各 key 元素的当前值 concat（先声明在高位）
+              val keyElems: Seq[(String, Int)] = t.keys.map { ke =>
+                ke.expr match {
+                  case Name(p, _) =>
+                    val s = slotForPath(p, ke.line)
+                    (cur(s.stateName), s.width)
+                  case other => throw new P4Error(
+                    s"行 ${ke.line}：runtime 表 key 只支持字段路径")
+                }
+              }
+              val keyVal = if (keyElems.length == 1) keyElems.head._1
+                           else b.concat(keyElems.map(_._1), bitsTy(rl.keyBits), s"key_$name")
+              b.send(tok, keyVal, s"tbl_${name}_key", Some(phKey), s"ks_$name")
+
+              // 拍 2：收 rsp（布局 hit | actId | args，hit 在最高位）
+              val rspW = 1 + rl.actW + rl.argW
+              val (_, rspData) = b.receive(tok, s"tbl_${name}_rsp", bitsTy(rspW), Some(phRsp), s"rs_$name")
+              val hitB = b.bitSlice(rspData, rl.argW + rl.actW, 1, s"hit_$name")
+              val actId = b.bitSlice(rspData, rl.argW, rl.actW, s"act_$name")
+              val argsB = b.bitSlice(rspData, 0, rl.argW, s"args_$name")
+
+              // 拍 3：按 actId 选择 action（各 cond 互斥）；default 表项作基线（hit=0）
+              val hitActs: Seq[(String, Map[Seq[String], String])] = t.actions.zipWithIndex.map { case (an, i) =>
+                val a = actionOf.getOrElse(an, throw new P4Error(
+                  s"行 $ln：table '$name' 引用了未知 action '$an'"))
+                val cond = b.binOp("and", hitB,
+                  b.eq(actId, b.literal(i, bitsTy(rl.actW), s"aid_${an}_$i")), "bits[1]", s"ra_${an}_$i")
+                // 形参 → args 位段切片（伪路径 $arg.<name> 映射到 proc 节点）
+                val argNodes: Map[String, String] =
+                  rl.argOffsets.getOrElse(an, Seq.empty).collect {
+                    case (pn, off, w) if w > 0 => pn -> b.bitSlice(argsB, off, w, s"rg_${an}_$pn")
+                  }.toMap
+                val argInputOf: Seq[String] => String = path =>
+                  if (path.headOption.contains("$arg"))
+                    argNodes.getOrElse(path(1), throw new P4Error(
+                      s"XlsBackend：内部错误 —— action '$an' 未知形参 '${path(1)}'"))
+                  else inputOf(path)
+                (cond, emitDagInto(b, actionDagArgNodes(a, resolver, externMap), argInputOf, s"${tag}_rt_$an", ext, Some(cond)))
+              }
+
+              val defaultOuts: Map[Seq[String], String] = t.entries.find(_.isDefault).map { e =>
+                val a = actionOf.getOrElse(e.action, throw new P4Error(
+                  s"行 ${e.line}：table '$name' 的 default 引用了未知 action '${e.action}'"))
+                // default 的 extern 写谓词 = 都不命中（~hit）
+                val dPred = Some(b.notNode(hitB, 1, s"miss_$tag"))
+                emitDagInto(b, actionDag(a, e.args, resolver, externMap), inputOf, s"${tag}_rt_dflt_${e.action}", ext, dPred)
+              }.getOrElse(Map.empty)
+
+              val touched = (defaultOuts.keySet ++ hitActs.flatMap(_._2.keySet)).toSeq
+              val finalOuts = touched.map { path =>
+                val s = slotForPath(path, 0)
+                var acc = defaultOuts.getOrElse(path, cur(s.stateName))
+                hitActs.reverse.foreach { case (cond, outs) =>
+                  outs.get(path).foreach { v =>
+                    acc = b.sel(cond, Seq(acc, v), Some(acc), bitsTy(s.width), s"${tag}_rtsel")
+                  }
+                }
+                path -> acc
+              }.toMap
+              // ⚠️ 动作应用与收 rsp 同拍（phRsp）—— 数据只在 p0_is_phRsp 拍有效。
+              finalOuts.foreach { case (path, v) =>
+                val s = slotForPath(path, 0)
+                selNext(phRsp, s.stateName, s.width, v, tag)
+              }
+              Map.empty[Seq[String], String]
+            } else {
             if (t.entries.isEmpty) throw new P4Error(s"行 $ln：table '$name' 无 const entries")
             if (t.keys.exists(_.matchKind != "exact"))
               throw new P4Error(s"行 $ln：table '$name' 目前只支持 exact 匹配")
@@ -473,8 +623,9 @@ object XlsBackend {
               }
             }
 
-            // 逐表项：hit 条件（逐 key 元素比较后 and —— 与整体 concat 后比较等价）+ action 输出
-            val entryHits: Seq[(String, Map[Seq[String], String])] =
+            // 逐表项：hit 条件（逐 key 元素比较后 and —— 与整体 concat 后比较等价）+ action 输出。
+            // ⚠️ extern 写必须带 hit 谓词（array_update 是效果不是数据，见 ExternHooks 注释）。
+            val entryHits: Seq[(String, Map[Seq[String], String], String)] =
               t.entries.filterNot(_.isDefault).map { e =>
                 val a = actionOf.getOrElse(e.action, throw new P4Error(
                   s"行 ${e.line}：table '$name' 引用了未知 action '${e.action}'"))
@@ -485,27 +636,33 @@ object XlsBackend {
                   b.eq(kn, b.literal(cv, bitsTy(kw), "ck"), "hit")
                 }
                 val hit = conds.reduceLeft((x, y) => b.binOp("and", x, y, "bits[1]", "hit"))
-                (hit, emitDagInto(b, actionDag(a, e.args, resolver, externMap), inputOf, s"${tag}_${e.action}", ext))
+                (hit, emitDagInto(b, actionDag(a, e.args, resolver, externMap), inputOf, s"${tag}_${e.action}", ext, Some(hit)), hit)
               }
 
-            // default 表项的输出作为基线（优先级最低）；各表项按**声明序**优先 ⇒ 倒序嵌套 sel
+            // default 表项的输出作为基线（优先级最低）；各表项按**声明序**优先 ⇒ 倒序嵌套 sel。
+            // default 的 extern 写谓词 = 都不命中（~anyHit）—— 命中条目时 default 不生效。
+            val anyHit: Option[String] = entryHits.headOption.map { _ =>
+              entryHits.map(_._3).reduceLeft((x, y) => b.binOp("or", x, y, "bits[1]", s"anyhit_$tag"))
+            }
             val defaultOuts: Map[Seq[String], String] = t.entries.find(_.isDefault).map { e =>
               val a = actionOf.getOrElse(e.action, throw new P4Error(
                 s"行 ${e.line}：table '$name' 的 default 引用了未知 action '${e.action}'"))
-              emitDagInto(b, actionDag(a, e.args, resolver, externMap), inputOf, s"${tag}_dflt_${e.action}", ext)
+              val dPred = anyHit.map(h => b.notNode(h, 1, s"miss_$tag"))
+              emitDagInto(b, actionDag(a, e.args, resolver, externMap), inputOf, s"${tag}_dflt_${e.action}", ext, dPred)
             }.getOrElse(Map.empty)
 
             val touched = (defaultOuts.keySet ++ entryHits.flatMap(_._2.keySet)).toSeq
             touched.map { path =>
               val s = slotForPath(path, 0)
               var acc = defaultOuts.getOrElse(path, cur(s.stateName))
-              entryHits.reverse.foreach { case (hit, eouts) =>
+              entryHits.reverse.foreach { case (h, eouts, _) =>
                 eouts.get(path).foreach { v =>
-                  acc = b.sel(hit, Seq(acc, v), Some(acc), bitsTy(s.width), s"${tag}_sel")
+                  acc = b.sel(h, Seq(acc, v), Some(acc), bitsTy(s.width), s"${tag}_sel")
                 }
               }
               path -> acc
             }.toMap
+            }   // end const-表（非 runtime）分支
 
           case v2: VarDecl => throw new P4Error(
             s"行 ${v2.line}：暂不支持 apply 体内的局部变量")

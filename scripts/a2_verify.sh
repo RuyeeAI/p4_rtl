@@ -33,6 +33,8 @@ case "$STEM" in
   demo2-match)        DEF_TOP="Ingress_control";  DEF_TB="$ROOT/testcases/a2/tb_demo2_match.v" ;;
   a2-parser-control)  DEF_TOP="Ingress_pipeline"; DEF_TB="$ROOT/testcases/a2/tb_a2_parser_control.v" ;;
   demo5-pipeline)     DEF_TOP="Ingress_pipeline"; DEF_TB="$ROOT/testcases/a2/tb_demo5_pipeline.v" ;;
+  demo7-runtime-table) DEF_TOP="Ingress_control";  DEF_TB="$ROOT/testcases/a2/tb_demo7_runtime_table.v" ;;
+  demo9-l3forwarder)  DEF_TOP="Ingress_pipeline"; DEF_TB="$ROOT/testcases/a2/tb_demo9_l3forwarder.v" ;;
   *)                  DEF_TOP="Top";              DEF_TB="" ;;
 esac
 
