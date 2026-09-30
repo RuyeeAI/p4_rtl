@@ -274,6 +274,28 @@ object XlsBackend {
     if (dupState.nonEmpty)
       throw new P4Error(s"XlsBackend：展平后 state 重名：${dupState.mkString(", ")}")
 
+    // ---- 4b) 对外输出布局：有 deparser ⇒ 按 emit 声明序拼接各 header 的 (valid, 字段…)，
+    // **不含 metadata**（metadata 是内部决策信息，不是报文）；通道名 pkt_out。
+    // 无 deparser ⇒ 退化为 PHV 全量拼接（headers + metadata），通道名 phv_out（既有行为）。
+    // 子集语义：无条件 emit —— 没有 isValid/变长，invalid header 输出全 0（valid=0）。
+    if (prog.deparser.isDefined && parserOpt.isEmpty)
+      throw new P4Error("XlsBackend：deparser 依赖 parser 产出的报文窗口，纯 control 程序不支持 deparser")
+    val outSlots: Seq[Slot] = prog.deparser match {
+      case Some(d) =>
+        val seen = scala.collection.mutable.LinkedHashSet.empty[Slot]
+        d.emits.foreach { e =>
+          val inst = e.path.last
+          val hi = insts.find(_.inst == inst).getOrElse(throw new P4Error(
+            s"行 ${e.line}：deparser emit 引用了未知的 header 实例 '$inst'"))
+          seen += validSlotOf(hi.inst)
+          hi.ht.fields.foreach(f => seen += fieldSlotOf(Seq(hi.inst, f.name)))
+        }
+        seen.toSeq
+      case None => phvSlots
+    }
+    val outWidth = outSlots.map(_.width).sum
+    val outChan = if (prog.deparser.isDefined) "pkt_out" else "phv_out"
+
     // ---- 5) 相位编码 ----
     val mainStates: Seq[String] =
       parserOpt.map(_.states.map(_.name).filter(n => n != "accept" && n != "reject")).getOrElse(Seq.empty)
@@ -286,15 +308,96 @@ object XlsBackend {
     val hasParser = parserOpt.isDefined
     val ctrlBase = if (pCount > 0) pCount else 1
     val stmts = ctrlOpt.map(_.applyBody).getOrElse(Seq.empty)
+    // ---- 5a-2) 并行查找组（lookup-group）：静态校验 + 相位合并 ----
+    // 组内 runtime 表**同拍**发 key、同拍收 rsp 并应用 —— 表间无依赖换查找延时省 N−1 拍。
+    // 违反下列任一约束即 P4Error（显式拒绝，绝不静默降级为串行）。
+    val tableOfAll: Map[String, Ast.TableDecl] =
+      ctrlOpt.map(_.tables.map(t => t.name -> t).toMap).getOrElse(Map.empty)
+    val actionOfAll: Map[String, Ast.ActionDecl] =
+      ctrlOpt.map(_.actions.map(a => a.name -> a).toMap).getOrElse(Map.empty)
+
+    /** action 的 PHV 写集 = body 里 Assign 的路径（extern 写不算 —— 状态单元不是查找依赖）。 */
+    def writeSet(a: Ast.ActionDecl): Set[Seq[String]] =
+      a.body.collect { case Ast.Assign(p, _, _) => p.toSeq }.toSet
+
+    /** 表全部 action 的写集并集。 */
+    def tableWriteSet(t: Ast.TableDecl): Set[Seq[String]] =
+      t.actions.flatMap(an => actionOfAll.get(an).map(writeSet).getOrElse(Set.empty)).toSet
+
+    /** 表的 key 读集（key 只支持字段路径）。 */
+    def keyReadSet(t: Ast.TableDecl): Set[Seq[String]] =
+      t.keys.collect { case Ast.KeyElem(Ast.Name(p, _), _, _) => p.toSeq }.toSet
+
+    // 每张表至多属一个组
+    prog.lookupGroups.flatMap(_.tables).groupBy(identity)
+      .filter(_._2.size > 1).keys.foreach { tn =>
+        throw new P4Error(s"XlsBackend：表 '$tn' 出现在多个 lookup-group 里（每张表至多属一组）")
+      }
+    prog.lookupGroups.foreach { g =>
+      // 组内表必须都是 runtime 表（静态融合表没有 key/rsp 通道，并行无意义）
+      g.tables.foreach { tn =>
+        tableOfAll.get(tn) match {
+          case Some(t) if t.isRuntime => ()
+          case Some(_) => throw new P4Error(
+            s"行 ${g.line}：lookup-group '${g.name}' 的成员表 '$tn' 不是 runtime 表" +
+              "（静态融合表是纯组合逻辑、无 key/rsp 通道，并行无意义）")
+          case None => throw new P4Error(
+            s"行 ${g.line}：lookup-group '${g.name}' 引用了未声明的表 '$tn'")
+        }
+      }
+      // 组内表必须在 apply 里相邻排列（否则夹在中间的语句时序会落在组的查找相位之间）
+      val idxs = stmts.zipWithIndex.collect {
+        case (Ast.TableApply(n, _), k) if g.tables.contains(n) => k
+      }
+      if (idxs.size != g.tables.size)
+        throw new P4Error(s"行 ${g.line}：lookup-group '${g.name}' 的成员表没有全部在 apply 里 apply")
+      if (idxs.nonEmpty && idxs.max - idxs.min + 1 != idxs.size)
+        throw new P4Error(s"行 ${g.line}：lookup-group '${g.name}' 的成员表在 apply 里不相邻" +
+          "（并行组必须连续排列，否则组间语句的相位会落在查找/应答之间）")
+      // 两两校验：先声明者的写集 vs 后声明者的 key 读集（并行 ⇒ 读到的是进入该拍时的快照）
+      g.tables.combinations(2).foreach {
+        case Seq(aName, bName) =>
+          val (ta, tb) = (tableOfAll(aName), tableOfAll(bName))
+          val wA = tableWriteSet(ta)
+          val clashKey = wA.intersect(keyReadSet(tb))
+          if (clashKey.nonEmpty)
+            throw new P4Error(
+              s"行 ${g.line}：lookup-group '${g.name}'：表 '$aName' 的写集与 '$bName' 的 key 读集相交" +
+                s"（${clashKey.map(_.mkString(".")).mkString(", ")}）—— 并行查找会让 '$bName' 读到旧值，请改回串行")
+          val clashW = wA.intersect(tableWriteSet(tb))
+          if (clashW.nonEmpty)
+            throw new P4Error(
+              s"行 ${g.line}：lookup-group '${g.name}'：表 '$aName' 与 '$bName' 的 action 写集相交" +
+                s"（${clashW.map(_.mkString(".")).mkString(", ")}）—— 同拍应用无法定义覆盖次序")
+      }
+    }
+    val groupOfTable: Map[String, Ast.LookupGroup] =
+      prog.lookupGroups.flatMap(g => g.tables.map(t => t -> g)).toMap
+    val firstStmtOfGroup: Map[String, Int] = {
+      val m = scala.collection.mutable.LinkedHashMap.empty[String, Int]
+      stmts.zipWithIndex.foreach { case (stmt, k) => stmt match {
+        case Ast.TableApply(n, _) => groupOfTable.get(n).foreach { g => if (!m.contains(g.name)) m(g.name) = k }
+        case _ =>
+      }}
+      m.toMap
+    }
+
     // 相位占用：**runtime 表 2 拍**（发 key；收 rsp 并同拍应用 action），其余语句 1 拍。
     // ⚠️ 不能把「应用 action」放到收 rsp 的下一拍：stages=2 流水化会把相邻相位的
     // 判据寄存器化（p0_is_phX），永远互相错开一拍 —— 而 receive 的数据只在
     // p0_is_phRsp 拍有效（其余拍被门控清零），下一拍应用时数据已经没了。
     // 应用是纯组合 sel，与接收同拍毫无问题。
+    // 并行组：**首表**占 2 拍，组内其余表 0 拍（base 与首表相同 ⇒ 同拍发 key/收 rsp）。
     val rtNames = ctrlOpt.toSeq.flatMap(_.tables).filter(_.isRuntime).map(_.name).toSet
-    val stmtLens: Seq[Int] = stmts.map {
-      case TableApply(n, _) => if (rtNames.contains(n)) 2 else 1
-      case _ => 1
+    val stmtLens: Seq[Int] = stmts.zipWithIndex.map { case (stmt, k) =>
+      stmt match {
+        case TableApply(n, _) if rtNames.contains(n) =>
+          groupOfTable.get(n) match {
+            case Some(g) => if (firstStmtOfGroup(g.name) == k) 2 else 0
+            case None    => 2
+          }
+        case _ => 1
+      }
     }
     val stmtBase: Seq[Int] = stmtLens.scanLeft(0)(_ + _)
     val ctrlSpan = stmtLens.sum
@@ -342,7 +445,7 @@ object XlsBackend {
     val inWidth = if (hasParser) PktWindowBits else phvWidth
     val b = new Builder(pkg, procName, ids)
     b.declareChan(inChan, "receive", inWidth, "valid_data")
-    b.declareChan("phv_out", "send", phvWidth, "ready_valid")
+    b.declareChan(outChan, "send", outWidth, "ready_valid")
     b.declareState("phase", bitsTy(pw), "0")
     if (hasParser) b.declareState("pkt", bitsTy(PktWindowBits), "0")
     allSlots.foreach(s => b.declareState(s.stateName, bitsTy(s.width), "0"))
@@ -532,13 +635,19 @@ object XlsBackend {
 
           case TableApply(name, ln) =>
             val t = tableOf.getOrElse(name, throw new P4Error(s"行 $ln：未知 table '$name'"))
+            // ⚠️ 并行组内**所有表**都用首表语句的 base —— 组内非首表在 scanLeft 前缀和里
+            // 会被排到首表的 rsp 相位，必须显式回指首表 base，才是真正的"同拍查找"。
+            val stmtPhaseBase = groupOfTable.get(name).flatMap(g => firstStmtOfGroup.get(g.name)) match {
+              case Some(k0) => stmtBase(k0)
+              case None     => stmtBase(k)
+            }
             if (t.isRuntime) {
               // ================= runtime 表：2 拍 =================
               // 拍1 发 key；拍2 收 rsp 并**同拍**应用 action（见 stmtLens 处的说明）。
               // 存储与匹配在外部表模块。
               val rl = rtLayouts.getOrElse(name, throw new P4Error(
                 s"行 $ln：内部错误 —— runtime 表 '$name' 无接口布局"))
-              val base = ctrlBase + stmtBase(k)
+              val base = ctrlBase + stmtPhaseBase
               val phKey = isPh(base)
               val phRsp = isPh(base + 1)   // 收 rsp + 应用 action（同一拍）
 
@@ -676,11 +785,11 @@ object XlsBackend {
       }
     }
 
-    // ---- 12) 输出 PHV ----
-    val outParts = phvSlots.map(s => nextOf(s.stateName))
-    val phv = if (outParts.length == 1) outParts.head
-              else b.concat(outParts, bitsTy(phvWidth), "phv")
-    val sOut = b.send(tok, phv, "phv_out", Some(isPh(phSend)), "snd")
+    // ---- 12) 对外输出 ----
+    val outParts = outSlots.map(s => nextOf(s.stateName))
+    val outData = if (outParts.length == 1) outParts.head
+                  else b.concat(outParts, bitsTy(outWidth), "out")
+    val sOut = b.send(tok, outData, outChan, Some(isPh(phSend)), "snd")
 
     // ---- 12b) extern 观察值：逐元素 array_index + concat（元素 0 在最高位）。
     // 数据取 extNext（本拍处理后的值）—— 观测者看到的是「已含本拍更新」的结果。

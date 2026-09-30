@@ -48,6 +48,8 @@ object Ast {
 
   // parser 专用
   final case class Extract(path: Seq[String], line: Int) extends Stmt
+  // deparser 专用：pkt.emit(<header 实例>);  —— path 不含 pkt 本身，如 Seq("hdr","ethernet")
+  final case class Emit(path: Seq[String], line: Int) extends Stmt
   sealed trait TransStmt extends Stmt
   final case class Goto(target: String, line: Int) extends TransStmt
   final case class Select(value: Expr, cases: Seq[(Expr, String)], default: String, line: Int) extends TransStmt
@@ -100,10 +102,28 @@ object Ast {
 
   final case class ParserDecl(name: String, params: Seq[ControlParam], states: Seq[ParserState], line: Int, stagesOpt: Option[Int] = None)
 
+  /** 报文重组阶段（标准 P4 的 deparser）：
+    *   `control D(packet_out pkt, in headers_t hdr) { pkt.emit(hdr.x); ... }`
+    *
+    * 子集语义：按 emit 声明序**无条件**拼接各 header 实例的 (valid, 字段…) ——
+    * 没有 isValid / 变长类型，因此 invalid header 输出全 0（valid=0）、输出宽度固定。
+    * 字段级的"编辑"发生在 control 的 action 里；deparser 只负责把编辑后的字段
+    * 重新组装成对外报文。 */
+  final case class DeparserDecl(name: String, params: Seq[ControlParam], emits: Seq[Emit], line: Int)
+
+  /** 并行查找组（`// p4c: lookup-group <组名> = 表1, 表2, ...`）：组内 runtime 表
+    * **同拍**发出 key、**同拍**收回 rsp 并应用 action —— 用"表间无依赖"换取
+    * 查找延时省 N−1 拍（串行时每张 runtime 表占 2 拍）。
+    * 约束（后端校验，违反即 P4Error）：组内表都必须是 runtime 表；每张表至多属一个组；
+    * 组内各表 action 的写集互斥；组内各表的 key 读集不得依赖组内其他表的写集。 */
+  final case class LookupGroup(name: String, tables: Seq[String], line: Int)
+
   final case class P4Program(
     headerTypes: Seq[HeaderType],
     structs: Seq[StructType],
     controls: Seq[ControlDecl],
     parsers: Seq[ParserDecl],
+    deparser: Option[DeparserDecl] = None,
+    lookupGroups: Seq[LookupGroup] = Seq.empty,
   )
 }

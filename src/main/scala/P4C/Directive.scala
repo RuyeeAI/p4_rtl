@@ -33,6 +33,9 @@ object Directive {
   /** 运行时表指示的载荷：表名 + 表深（size）。 */
   final case class TableDirective(name: String, size: Int)
 
+  /** 并行查找组指示的载荷：组名 + 成员表名（有序，声明序即组内 key 位序语义的参考）。 */
+  final case class GroupDirective(name: String, tables: Seq[String])
+
   /** 运行时表的缺省表深（`size=N` 省略时，主理人 Q1 裁定）。 */
   val DefaultTableSize: Int = 4
 
@@ -49,6 +52,9 @@ object Directive {
     sourceLines: IndexedSeq[String],
     suppressedInBlock: Seq[(Int, String)] = Seq.empty,
     tableDirectives: Map[Int, TableDirective] = Map.empty,
+    /** 并行查找组指示：行号 → 载荷。**顶层作用域**（不参与紧邻性匹配与认领），
+      * 由 Parser 组装进 `P4Program.lookupGroups`，依赖校验在后端。 */
+    groupDirectives: Seq[(Int, GroupDirective)] = Seq.empty,
   )
 
   object ScanResult {
@@ -63,6 +69,8 @@ object Directive {
   private val valueRe = "(?i)^\\s*//\\s*p4c\\s*:\\s*stages\\s*=\\s*(\\d+)(?:\\s.*)?$".r
   // 运行时表行：table <表名> runtime [size=N]（表名是紧邻性的冗余校验；size 缺省 DefaultTableSize）。
   private val tableRe = "(?i)^\\s*//\\s*p4c\\s*:\\s*table\\s+([A-Za-z_]\\w*)\\s+runtime(?:\\s+size\\s*=\\s*(\\d+))?(?:\\s.*)?$".r
+  // 并行查找组行（顶层作用域）：lookup-group <组名> = <表1>, <表2>[, ...]
+  private val groupRe = "(?i)^\\s*//\\s*p4c\\s*:\\s*lookup-group\\s+([A-Za-z_]\\w*)\\s*=\\s*(.+?)\\s*$".r
 
   /** 扫描原始源码中的全部编译指示。
     *   - 触发段（`// p4c:`）落在块注释内的行 → 抑制（记入 suppressedInBlock）：
@@ -74,6 +82,7 @@ object Directive {
     val lines = src.split("\n", -1).toIndexedSeq
     val map = mutable.LinkedHashMap.empty[Int, Int]
     val tmap = mutable.LinkedHashMap.empty[Int, TableDirective]
+    val gmap = mutable.LinkedHashMap.empty[Int, GroupDirective]
     val suppressed = mutable.ArrayBuffer.empty[(Int, String)]
     var off = 0 // 当前行首字符在 src/code 中的偏移（'\n' 占 1，与 split("\n") 对齐）
     lines.zipWithIndex.foreach { case (ln, i) =>
@@ -98,16 +107,27 @@ object Directive {
               if (size < 1)
                 throw new P4Error(s"行 $lineNo：p4c: table $tname runtime 的 size 必须 ≥ 1（got $size）")
               tmap(lineNo) = TableDirective(tname, size)
-            case None =>
-              throw new P4Error(
-                s"行 $lineNo：无法解析的 p4c 编译指示（期望 '// p4c: stages=N'（N ≥ 1）" +
-                  s"或 '// p4c: table <表名> runtime [size=N]'）：'${ln.trim}'")
+            case None => groupRe.findFirstMatchIn(ln) match {
+              case Some(g) =>
+                val gname = g.group(1)
+                val tabs = g.group(2).split(",").map(_.trim).filter(_.nonEmpty).toSeq
+                if (tabs.isEmpty)
+                  throw new P4Error(s"行 $lineNo：lookup-group $gname 的成员表列表为空")
+                if (tabs.distinct.size != tabs.size)
+                  throw new P4Error(s"行 $lineNo：lookup-group $gname 的成员表重复：${tabs.mkString(",")}")
+                gmap(lineNo) = GroupDirective(gname, tabs)
+              case None =>
+                throw new P4Error(
+                  s"行 $lineNo：无法解析的 p4c 编译指示（期望 '// p4c: stages=N'（N ≥ 1）、" +
+                    s"'// p4c: table <表名> runtime [size=N]' 或 " +
+                    s"'// p4c: lookup-group <组名> = <表1>, <表2>, ...'）：'${ln.trim}'")
+            }
           }
         }
       }
       off += ln.length + 1
     }
-    ScanResult(map.toMap, lines, suppressed.toSeq, tmap.toMap)
+    ScanResult(map.toMap, lines, suppressed.toSeq, tmap.toMap, gmap.toSeq)
   }
 
   /** 声明行 `declLine` 的生效切拍指示（[[tableFor]] 的同构运行时表版本共用

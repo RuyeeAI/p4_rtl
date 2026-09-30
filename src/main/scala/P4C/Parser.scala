@@ -62,10 +62,17 @@ class Parser(toks0: Seq[Tok], scan: Directive.ScanResult = Directive.ScanResult.
     val structs = scala.collection.mutable.ArrayBuffer.empty[StructType]
     val controls = scala.collection.mutable.ArrayBuffer.empty[ControlDecl]
     val parsers = scala.collection.mutable.ArrayBuffer.empty[ParserDecl]
+    var deparser: Option[DeparserDecl] = None
     while (cur.kind != TEOF) {
       if (isIdent("header")) headerTypes += parseHeaderType()
       else if (isIdent("struct")) structs += parseStruct()
-      else if (isIdent("control")) controls += parseControl()
+      else if (isIdent("control")) parseControl() match {
+        case Left(c)  => controls += c
+        case Right(d) =>
+          if (deparser.isDefined)
+            throw new P4Error(s"行 ${d.line}：程序里出现了第二个 deparser '${d.name}'（已有 '${deparser.get.name}'）")
+          deparser = Some(d)
+      }
       else if (isIdent("parser")) parsers += parseParser()
       // W0 止损（缺口分析 R5）：typedef 曾被静默跳过，引用处报"未知的输出路径"迷惑用户
       else if (isIdent("typedef"))
@@ -74,7 +81,21 @@ class Parser(toks0: Seq[Tok], scan: Directive.ScanResult = Directive.ScanResult.
       else if (isIdent("const")) parseConstDecl()
       else skipDecl() // package / instantiation 等架构样板：跳过
     }
-    P4Program(headerTypes.toSeq, structs.toSeq, controls.toSeq, parsers.toSeq)
+
+    // ---- 并行查找组（顶层指示，parseProgram 级消费）：组名去重 + 成员表必须存在 ----
+    val lookupGroups = scan.groupDirectives.map { case (ln, g) => LookupGroup(g.name, g.tables, ln) }
+    val tableNames = controls.flatMap(_.tables.map(_.name)).toSet
+    lookupGroups.foreach { g =>
+      if (g.tables.isEmpty)
+        throw new P4Error(s"行 ${g.line}：lookup-group '${g.name}' 的成员表列表为空")
+      g.tables.foreach { t =>
+        if (!tableNames.contains(t))
+          throw new P4Error(s"行 ${g.line}：lookup-group '${g.name}' 引用了未声明的表 '$t'")
+      }
+    }
+
+    P4Program(headerTypes.toSeq, structs.toSeq, controls.toSeq, parsers.toSeq,
+      deparser = deparser, lookupGroups = lookupGroups)
   }
 
   /** 顶层 const 常量表（R5）：name → (值, 声明宽)。[[parsePrimary]] 处按名替换为带宽字面量。 */
@@ -303,7 +324,9 @@ class Parser(toks0: Seq[Tok], scan: Directive.ScanResult = Directive.ScanResult.
 
   // ---------------- control ----------------
 
-  private def parseControl(): ControlDecl = {
+  /** control 声明：参数含 `packet_out` ⇒ 报文重组阶段（deparser），否则普通 control。
+    * 返回 Left(普通 control) / Right(deparser)。 */
+  private def parseControl(): Either[ControlDecl, DeparserDecl] = {
     val declLine = line
     eat("control")
     val name = eatIdent()
@@ -311,21 +334,49 @@ class Parser(toks0: Seq[Tok], scan: Directive.ScanResult = Directive.ScanResult.
     if (accept("<")) { var d = 1; while (d > 0 && cur.kind != TEOF) { if (cur.text == "<") d += 1 else if (cur.text == ">") d -= 1; pos += 1 } }
     eat("(")
     val params = scala.collection.mutable.ArrayBuffer.empty[ControlParam]
+    // 方向可省略（packet_in pkt / packet_out pkt 无方向关键字），与 parseParser 同口径
+    def parseOneParam(): ControlParam = {
+      val dir = if (isIdent("inout") || isIdent("out") || isIdent("in")) { val d = cur.text; pos += 1; d }
+                else "in"
+      val tn = eatIdent()
+      val pn = eatIdent()
+      ControlParam(pn, dir, tn, line)
+    }
     if (!is(")")) {
-      params += {
-        val dir = eatIdent() // inout / in / out
-        val tn = eatIdent()
-        val pn = eatIdent()
-        ControlParam(pn, dir, tn, line)
-      }
-      while (accept(",")) {
-        val dir = eatIdent()
-        val tn = eatIdent()
-        val pn = eatIdent()
-        params += ControlParam(pn, dir, tn, line)
-      }
+      params += parseOneParam()
+      while (accept(",")) params += parseOneParam()
     }
     eat(")")
+
+    // ---- deparser：body 只允许 `<packet_out 参数>.emit(<header 实例>);` ----
+    // 子集语义：无条件按序 emit（无 isValid / 变长），emit 顺序即输出位序。
+    if (params.exists(_.typeName == "packet_out")) {
+      val emits = scala.collection.mutable.ArrayBuffer.empty[Emit]
+      eat("{")
+      while (!is("}")) {
+        val ln = line
+        val inst = eatIdent()
+        params.find(_.name == inst) match {
+          case Some(p) if p.typeName == "packet_out" => ()
+          case _ => err(s"deparser 体内只允许对 packet_out 参数调用 emit（got '$inst'）")
+        }
+        eat(".")
+        val m = eatIdent()
+        if (m != "emit") err(s"deparser 只支持 emit（got '$m'）")
+        eat("(")
+        val path = scala.collection.mutable.ArrayBuffer.empty[String]
+        path += eatIdent()
+        while (accept(".")) path += eatIdent()
+        if (path.length != 2) err("emit 的参数必须是 '<结构参数>.<header 成员>' 两段路径")
+        eat(")")
+        eat(";")
+        emits += Emit(path.toSeq, ln)
+      }
+      eat("}")
+      if (emits.isEmpty) err("deparser 至少要有一个 pkt.emit(...)")
+      return Right(DeparserDecl(name, params.toSeq, emits.toSeq, declLine))
+    }
+
     eat("{")
     val actions = scala.collection.mutable.ArrayBuffer.empty[ActionDecl]
     val tables = scala.collection.mutable.ArrayBuffer.empty[TableDecl]
@@ -343,7 +394,7 @@ class Parser(toks0: Seq[Tok], scan: Directive.ScanResult = Directive.ScanResult.
       else skipStmt() // 未知语句（注解、default_action 残留等）
     }
     eat("}")
-    ControlDecl(name, params.toSeq, actions.toSeq, tables.toSeq, externs.toSeq, applyBody, line, directiveAt(declLine))
+    Left(ControlDecl(name, params.toSeq, actions.toSeq, tables.toSeq, externs.toSeq, applyBody, line, directiveAt(declLine)))
   }
 
   /** `Register(bit<16>, 8) name;` / `Counter(bit<32>, 8) name;` */

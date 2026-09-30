@@ -1420,6 +1420,15 @@ object ChiselBackend {
     clock: Option[Int] = None, model: DelayModel = DelayModels.default,
     irDump: Option[(String, Ir.Dag) => Unit] = None,
   ): String = {
+    // ⚠️ deparser 在 Chisel 线暂不发射报文输出 —— **告警并跳过**，不静默也不阻断：
+    //  - deparser 本身没有 action，IR 级 fn dump（irDump 回调）不受影响，形式验证照常；
+    //  - 但生成的 Chisel 模块**没有报文输出端口**，需要报文输出的场景请走 XLS 线
+    //    （XlsBackend 支持 deparser：emit 序 header 拼接为 pkt_out 通道）。
+    // lookup-group 仅约束 XLS 线的 proc 相位编排，Chisel 线的 runtime 表是端口+存储
+    // 模型、无"查找相位"概念，无需同步。
+    prog.deparser.foreach(d => System.err.println(
+      s"[P4C] 警告：行 ${d.line} —— Chisel 线暂不发射 deparser '${d.name}'（生成的模块无报文输出端口；" +
+        "XLS 线已支持报文重组，需要时请走 XLS 线）"))
     val (modules, _) = emitModules(prog, moduleNamePrefix, sourceName, stages, sigs, clock, model, irDump)
     emitTypes(prog) + "\n" + modules
   }

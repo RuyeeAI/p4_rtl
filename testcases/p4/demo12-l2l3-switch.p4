@@ -1,27 +1,33 @@
-// demo12：二层/三层混合交换机 —— L2 转发 + L3 路由 + 报文编辑
+// demo12：二层/三层混合交换机 —— 并行查找 + 合并仲裁 + 报文编辑 + 报文重组
 //
-// 覆盖点：
-//   - L2：目的 MAC 精确匹配 → 指定端口转发 / 上送三层 / 未知单播泛洪
-//   - L3：目的 IP 精确匹配（/32 主机路由）→ 下一跳 + 出端口
-//   - 报文编辑三件套：重写目的/源 MAC、TTL 递减、IP 头校验和增量更新（RFC 1624）
-//   - 端口位图表达出端口（单播 = 独热，泛洪 = 掩码），出端口索引供状态单元寻址
-//   - TTL 耗尽丢弃、每端口字节统计（Register 读改写）、每类转发计数（Counter）
+// 与 v1 对比的三个升级（对应郝宇的三条要求）：
+//   1. **报文编辑/重组显式化**：新增 `control Deparser(packet_out pkt, in hdr)`，
+//      按 emit 声明序把编辑后的 header 重组为对外报文（通道 pkt_out）。
+//      字段级编辑集中在 resolve action 的「报文编辑」段（改下一跳/源 MAC、
+//      TTL 递减、IP 校验和 RFC 1624 增量更新），读表决策结果、三元门控改包。
+//   2. **查找表外置**：mac_table / route_table 声明为 runtime 表 ⇒ 生成
+//      tbl_<表名>_key / tbl_<表名>_rsp 通道，存储与匹配在外部表模块（控制面可写）。
+//      ttl_guard 是防御逻辑不是配置表，保持静态融合（两种形态共存）。
+//   3. **并行查找分组**：`// p4c: lookup-group g0 = mac_table, route_table`
+//      两张表**同拍**发出 key、同拍收回 rsp —— 查找延时从 2×2 拍降到 2 拍。
+//      前提是表间无依赖：classify 预先算好门控位 meta.isL3（只看报文字段），
+//      两表的 key 都不依赖对方的写集（工具链会校验，违反即报错）。
 //
-// 子集约束下的两个设计要点（务必先读）：
-//   1. **没有 if/else 语句** ⇒ 用"元数据参与表 key"来实现门控：
-//      route_table 的 key 含 meta.fwdType，只有 L2 判定为"上三层"（FWD_L3）的包
-//      才可能命中路由条目；L2/泛洪的包 key 不匹配，落到 default nop 直通。
-//      这样下游表就不会误改报文，等价于"条件执行"。
-//   2. **字段单一写者** ⇒ 每个字段只由一组互斥的 action 写：
-//      meta.ipLen/dropReason 归 classify；fwdType/outPort/outPortIdx 由
-//      mac_table 的三个 action（互斥）→ route_table 的 l3_forward（条件覆盖）
-//      → ttl_guard 的 drop_ttl（条件覆盖）依次演进，形成流水状态机语义。
+// 处理流水（拍数按 proc 相位）：
+//   parser(Ethernet→IPv4→UDP/TCP)
+//   → classify()          预分类（isL3 门控位）+ 清理决策字段
+//   → mac_table  ┐        runtime 表，并行查找组 g0：同拍发 key / 同拍收 rsp
+//   → route_table┘        命中结果写入各自的决策字段（macHit/macPort、rtHit/rtPort/…）
+//   → resolve()           合并仲裁（L3 > L2 > 泛洪），只写决策字段
+//   → rewrite()           **报文编辑**（MAC 重写/TTL 递减/校验和增量）+ 字节统计
+//   → ttl_guard           静态表：路由后 TTL == 0 ⇒ 丢弃
+//   → Deparser            emit 序重组报文（ethernet → ipv4 → udp → tcp）
 //
-// 子集限制（本 demo 未使用，属工具链已知缺口）：
-//   - 不支持 lpm/ternary ⇒ 路由只能是 /32 主机路由，无最长前缀匹配
-//   - 不支持 header stack / setValid ⇒ 无法插入或剥离 VLAN tag（变长封装会
-//     使同一 header 在不同路径上的字节偏移不同，工具链直接报错）
-//   - 不支持 apply 内局部变量 ⇒ 旧 TTL 只能用表达式复用，不能存临时变量
+// 子集约束的应对（工具链边界见 docs/Demo12-L2L3交换机.md §2）：
+//   - 无 if/else ⇒ 决策合并与报文编辑全部用三元表达式 + "meta 参与表 key" 门控
+//   - 无 apply 内局部变量 ⇒ 旧 TTL 用表达式复用（先算校验和再减 TTL，顺序不能反）
+//   - 表 key 只能是字段路径 ⇒ L3 是 /32 主机路由（无 LPM）
+//   - 无 header stack / setValid ⇒ 无 VLAN 增删；emit 无条件（invalid header 输出全 0）
 #include <core.p4>
 
 // ---------------- 协议常量 ----------------
@@ -40,14 +46,13 @@ const bit<8> DROP_NONE = 8w0;
 const bit<8> DROP_TTL  = 8w1;
 
 // ---------------- 交换机本机参数（Demo 用常量固化） ----------------
-const bit<48> SWITCH_MAC = 48w0x020000000001;   // 三层口/交换机 MAC，也是重写后的源 MAC
+const bit<48> SWITCH_MAC = 48w0x020000000001;   // 三层口/交换机 MAC，也是 L3 重写后的源 MAC
 const bit<48> NH_MAC_1   = 48w0x001122334455;   // 10.0.0.1 的下一跳 MAC
 const bit<48> NH_MAC_2   = 48w0x00aabbccddee;   // 10.0.0.2 的下一跳 MAC
 const bit<48> NH_MAC_3   = 48w0x00deadbeef01;   // 10.0.0.3 的下一跳 MAC
 
-// 端口 0 = 上联口（L3 出口），端口 1..3 = 用户接入口
-const bit<16> PM_UPLINK  = 16w0x0001;           // 端口 0 的位图
-const bit<16> PM_FLOOD   = 16w0x000e;           // 端口 1/2/3 的位图（不含上联）
+// 端口 0 = 上联口（L3 出口），端口 1..3 = 用户接入口；outPort 统一用位图表达
+const bit<16> PM_FLOOD = 16w0x000e;             // 泛洪掩码：端口 1/2/3（不含上联）
 
 // ---------------- headers ----------------
 header ethernet_h {
@@ -99,13 +104,24 @@ struct headers_t {
     tcp_h      tcp;
 }
 
-// 转发决策与统计的载体（也是对外可观测的输出）
+// 决策信息（内部，不进对外报文 —— 见 Deparser 的 emit 清单）
 struct metadata_t {
-    bit<8>  fwdType;      // FWD_*：本包走哪条转发路径
-    bit<16> outPort;      // 出端口位图（单播 = 独热，泛洪 = 掩码）
-    bit<4>  outPortIdx;   // 出端口号（泛洪时无意义），供状态单元寻址
-    bit<8>  dropReason;   // DROP_*
-    bit<16> ipLen;        // IPv4 totalLen（非 IPv4 包为 0），仅供字节统计
+    // 预分类（classify 写）
+    bit<8>  isL3;       // 门控位：目的 MAC == 交换机 MAC ⇒ 该查路由表
+    bit<16> ipLen;      // IPv4 totalLen（非 IPv4 包为 0）
+    bit<8>  dropReason;
+    // mac_table 查找结果
+    bit<8>  macHit;
+    bit<4>  macPort;
+    // route_table 查找结果
+    bit<8>  rtHit;
+    bit<4>  rtPort;
+    bit<48> rtDstMac;   // 下一跳 MAC（编辑后的目的 MAC）
+    bit<48> rtSrcMac;   // 重写后的源 MAC
+    // 合并仲裁（resolve 写）
+    bit<8>  fwdType;    // FWD_*
+    bit<16> outPort;    // 出端口位图（单播 = 独热，泛洪 = 掩码）
+    bit<4>  outPortIdx; // 出端口号（泛洪 = 15）
 }
 
 // ---------------- parser ----------------
@@ -145,60 +161,83 @@ parser Top(packet_in pkt, out headers_t hdr) {
 
 // ---------------- ingress control ----------------
 control Ingress(inout headers_t hdr, inout metadata_t meta) {
-    Register(bit<32>, 8) portBytes;    // 每出端口累计字节数（按 meta.ipLen 累加）
-    Counter(bit<32>, 4)  fwdCnt;       // 每类转发包计数：0=L2 1=L3 2=丢弃 3=泛洪
+    Register(bit<32>, 8) portBytes;    // 每出端口累计字节数（resolve 条件累加）
+    Counter(bit<32>, 4)  fwdCnt;       // 每类转发包计数（表 action 内，hit 自动门控）
+                                       //   0=L2  1=L3  2=丢弃
 
-    // ---- 报文分类：只负责 ipLen / dropReason 两个字段 ----
+    // ---- 预分类：只看报文字段，不依赖任何表 ⇒ 并行查找的前提 ----
     action classify() {
-        meta.ipLen = hdr.ipv4.totalLen;   // 非 IPv4 包该槽位为 0
+        meta.isL3 = (hdr.ethernet.dstAddr == SWITCH_MAC) ? 8w1 : 8w0;
+        meta.ipLen = hdr.ipv4.totalLen;             // 非 IPv4 包该槽位为 0
         meta.dropReason = DROP_NONE;
+        meta.macHit = 8w0;
+        meta.rtHit  = 8w0;
     }
 
-    // ---- 二层转发：按目的 MAC 从指定端口送出 ----
+    // ---- mac_table 的动作：只写自己的决策字段，不改报文 ----
     action l2_forward(bit<4> port) {
-        meta.fwdType = FWD_L2;
-        meta.outPortIdx = port;
-        meta.outPort = 16w1 << port;
-        portBytes.write(port[2:0], portBytes.read(port[2:0]) + meta.ipLen);
+        meta.macHit  = 8w1;
+        meta.macPort = port;
         fwdCnt.count(8w0);
     }
-
-    // ---- 未知单播泛洪：送到 mask 指定的全部端口 ----
-    action flood(bit<16> mask) {
-        meta.fwdType = FWD_FLOOD;
-        meta.outPortIdx = 4w15;           // 15 = 无单一出端口（位图代表多个）
-        meta.outPort = mask;
-        fwdCnt.count(8w3);
+    action l2_miss() {
+        meta.macHit = 8w0;
     }
 
-    // ---- 上送三层：只置转发类型，出端口交由路由动作决定 ----
-    action to_l3() {
-        meta.fwdType = FWD_L3;
-    }
-
-    // ---- 三层路由 + 报文编辑 ----
-    // 编辑三件套：目的 MAC 换成下一跳、源 MAC 换成本机、TTL 递减且增量更新校验和
+    // ---- route_table 的动作：只写自己的决策字段，不改报文 ----
+    // 下一跳 MAC 作为决策数据带出来，编辑统一在 resolve 做（报文编辑显式化）
     action l3_forward(bit<4> port, bit<48> nexthopMac, bit<48> srcMac) {
-        meta.fwdType = FWD_L3;
-        meta.outPortIdx = port;
-        meta.outPort = 16w1 << port;
-
-        // ① 先更新校验和 —— 此刻 hdr.ipv4.ttl 还是旧值
-        //    RFC 1624 增量式：HC' = ~(~HC + ~m + m')，m = 旧 TTL 零扩到 16 位
-        hdr.ipv4.hdrChecksum = ~(~hdr.ipv4.hdrChecksum
-                               + ~((bit<16>)hdr.ipv4.ttl)
-                               + ((bit<16>)hdr.ipv4.ttl - 16w1));
-        // ② 再递减 TTL（顺序不能反：反了上面读到的就是新值）
-        hdr.ipv4.ttl = hdr.ipv4.ttl - 8w1;
-        // ③ 重写二层地址
-        hdr.ethernet.dstAddr = nexthopMac;
-        hdr.ethernet.srcAddr = srcMac;
-
-        portBytes.write(port[2:0], portBytes.read(port[2:0]) + meta.ipLen);
+        meta.rtHit    = 8w1;
+        meta.rtPort   = port;
+        meta.rtDstMac = nexthopMac;
+        meta.rtSrcMac = srcMac;
         fwdCnt.count(8w1);
     }
+    action l3_miss() {
+        meta.rtHit = 8w0;
+    }
 
-    // ---- TTL 耗尽：丢弃（在三层编辑之后判定，故 TTL=1 的包在此被拦下）----
+    // ---- 阶段 1：合并仲裁（只写决策字段）----
+    // 决策优先级：L3 命中 > L2 命中 > 泛洪（两条查找并行发出，必须在此合并）。
+    // ⚠️ 同一 action 内后一条语句读到的是**入口快照**，不是本 action 前面刚写的值
+    //（W1 顺序组合语义）—— 所以统计/编辑必须放到下一个 action（rewrite），
+    // 靠相位边界更新快照，才能读到这里写出的 fwdType/outPortIdx。
+    action resolve() {
+        meta.fwdType = (meta.rtHit == 8w1) ? FWD_L3
+                     : ((meta.macHit == 8w1) ? FWD_L2 : FWD_FLOOD);
+        meta.outPortIdx = (meta.rtHit == 8w1) ? meta.rtPort
+                        : ((meta.macHit == 8w1) ? meta.macPort : 4w15);
+        meta.outPort = (meta.rtHit == 8w1) ? (16w1 << meta.rtPort)
+                     : ((meta.macHit == 8w1) ? (16w1 << meta.macPort) : PM_FLOOD);
+    }
+
+    // ---- 阶段 2：报文编辑 + 统计（读 resolve 的决策结果）----
+    // 编辑门控：仅 L3 路由命中才改包；ttl=0 时不编辑（防 8 位下溢），由 ttl_guard 拦下。
+    action rewrite() {
+        // ① IP 校验和增量更新（RFC 1624：HC' = ~(~HC + ~m + m')，m = 旧 TTL）
+        hdr.ipv4.hdrChecksum = (meta.rtHit == 8w1 && hdr.ipv4.ttl != 8w0)
+            ? ~(~hdr.ipv4.hdrChecksum
+                + ~((bit<16>)hdr.ipv4.ttl)
+                + ((bit<16>)hdr.ipv4.ttl - 16w1))
+            : hdr.ipv4.hdrChecksum;
+        // ② TTL 递减
+        hdr.ipv4.ttl = (meta.rtHit == 8w1 && hdr.ipv4.ttl != 8w0)
+            ? hdr.ipv4.ttl - 8w1
+            : hdr.ipv4.ttl;
+        // ③ 重写二层地址
+        hdr.ethernet.dstAddr = (meta.rtHit == 8w1) ? meta.rtDstMac : hdr.ethernet.dstAddr;
+        hdr.ethernet.srcAddr = (meta.rtHit == 8w1) ? meta.rtSrcMac : hdr.ethernet.srcAddr;
+        // ④ TTL 耗尽标记 —— ⚠️ 此处读到的 ttl 是**本 action 入口快照**（编辑前），
+        //    旧 TTL ≤ 1 ⇔ 减后为 0 或已耗尽 ⇒ 交给 ttl_guard 拦下
+        meta.dropReason = (meta.rtHit == 8w1 && hdr.ipv4.ttl <= 8w1) ? DROP_TTL : DROP_NONE;
+        // ⑤ 每端口字节统计：fwdType/outPortIdx 是上一相位（resolve）写出的，可安全读取
+        portBytes.write(meta.outPortIdx[2:0],
+            portBytes.read(meta.outPortIdx[2:0]) +
+            ((meta.fwdType == FWD_L2 || meta.fwdType == FWD_L3)
+                ? (bit<32>)meta.ipLen : 32w0));
+    }
+
+    // ---- TTL 耗尽：丢弃（静态表；resolve 之后才能看到编辑后的 TTL）----
     action drop_ttl() {
         meta.fwdType = FWD_DROP;
         meta.dropReason = DROP_TTL;
@@ -207,46 +246,41 @@ control Ingress(inout headers_t hdr, inout metadata_t meta) {
 
     action nop() { }
 
-    // ---- 表 1：L2 目的 MAC 表（静态融合，编译期展开）----
+    // ---- 表 1：L2 目的 MAC 表（runtime：控制面可写）----
+    // ⚠️ runtime 表只固化结构（key/actId/args 位宽），表项由控制面经写接口下发
+    //（示例条目：48w0x001122334455 → l2_forward(4w1)，见 docs/Demo12-L2L3交换机.md §5）
+    // p4c: table mac_table runtime size=8
     table mac_table {
         key = {
             hdr.ethernet.dstAddr : exact;
         }
         actions = {
             l2_forward;
-            to_l3;
-            flood;
+            l2_miss;
         }
         const entries = {
-            48w0x001122334455 : l2_forward(4w1);
-            48w0x00aabbccddee : l2_forward(4w2);
-            48w0x00deadbeef01 : l2_forward(4w3);
-            SWITCH_MAC        : to_l3();          // 目的为本机 MAC ⇒ 上三层
-            default           : flood(PM_FLOOD);  // 未知单播 ⇒ 泛洪
+            default : l2_miss();     // 未命中 ⇒ resolve 判泛洪
         }
     }
 
-    // ---- 表 2：L3 路由表（静态融合；key 含 fwdType 起门控作用）----
-    // 只有 mac_table 判为"上三层"的包（fwdType == FWD_L3）才可能命中路由条目，
-    // 其余包的 key 第二段是合法 IP 但第一段不匹配，落到 default nop 直通。
+    // ---- 表 2：L3 路由表（runtime；key 含预分类位 ⇒ 只有"上三层"的包才可能命中）----
+    // 控制面下发表项示例：meta.isL3=1 + 目的 IP + 下一跳 MAC/端口
+    // p4c: table route_table runtime size=16
     table route_table {
         key = {
-            meta.fwdType     : exact;
-            hdr.ipv4.dstAddr : exact;
+            meta.isL3        : exact;   // 预分类门控（classify 写，不依赖任何表）
+            hdr.ipv4.dstAddr : exact;   // /32 主机路由（子集无 LPM）
         }
         actions = {
             l3_forward;
-            nop;
+            l3_miss;
         }
         const entries = {
-            8w2, 32w0x0a000001 : l3_forward(4w0, NH_MAC_1, SWITCH_MAC);
-            8w2, 32w0x0a000002 : l3_forward(4w0, NH_MAC_2, SWITCH_MAC);
-            8w2, 32w0x0a000003 : l3_forward(4w0, NH_MAC_3, SWITCH_MAC);
-            default            : nop();
+            default : l3_miss();
         }
     }
 
-    // ---- 表 3：TTL 守卫（路由后 TTL 归零 ⇒ 丢弃）----
+    // ---- 表 3：TTL 守卫（静态融合：防御逻辑，控制面不写）----
     table ttl_guard {
         key = {
             meta.fwdType : exact;
@@ -264,8 +298,23 @@ control Ingress(inout headers_t hdr, inout metadata_t meta) {
 
     apply {
         classify();
-        mac_table.apply();
-        route_table.apply();
-        ttl_guard.apply();
+        // 并行查找组：下面两张 runtime 表同拍发 key / 同拍收 rsp（工具链校验表间无依赖：
+        // mac_table 的 key 只读报文、route_table 的 key 只读报文+预分类位，互不依赖对方写集）
+        // p4c: lookup-group g0 = mac_table, route_table
+        mac_table.apply();     // ┐ 同拍发 key
+        route_table.apply();   // ┘ 同拍收 rsp 并应用 —— 查找延时 2 拍（串行需 4 拍）
+        resolve();             // 合并仲裁（决策字段）
+        rewrite();             // 报文编辑 + 统计
+        ttl_guard.apply();     // TTL 守卫
     }
+}
+
+// ---------------- 报文重组（deparser）----------------
+// 按 emit 声明序把编辑后的 header 重组为对外报文（通道 pkt_out）。
+// 子集语义：无条件 emit；metadata 不进报文（它是内部决策信息）。
+control Deparser(packet_out pkt, in headers_t hdr) {
+    pkt.emit(hdr.ethernet);
+    pkt.emit(hdr.ipv4);
+    pkt.emit(hdr.udp);
+    pkt.emit(hdr.tcp);
 }

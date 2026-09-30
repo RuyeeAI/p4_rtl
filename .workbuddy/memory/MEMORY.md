@@ -101,9 +101,15 @@
 
 可用：顶层 `const`、多 key 表、`sel`/三元/`~`/`~~`、切片读、Cast `(bit<N>)x`、
 `Register`/`Counter`（read 表达式 + write/count 语句）、`// p4c: table X runtime size=N`、
-`// p4c: stages=N`。活样本：`testcases/p4/`（demo9 综合、demo10 多 key、demo12 交换机）。
+`// p4c: stages=N`、**deparser**（`control D(packet_out pkt, in hdr){pkt.emit(...);}`，
+XLS 线出 pkt_out 通道；Chisel 线告警跳过）、
+**`// p4c: lookup-group <组名> = 表1,表2,...`**（组内 runtime 表同拍发 key/收 rsp，
+工具链校验：必须 runtime 表/至多一组/apply 相邻/写集互斥/先表写集∩后表 key 读集=∅）。
+活样本：`testcases/p4/`（demo9 综合、demo10 多 key、demo12 交换机：并行查找+deparser）。
 
 **字段单一写者原则**：顺序组合语义下后写覆盖先写 ⇒ 每个字段只由一组互斥 action 写。
+⚠️ 更强：**同一 action 内读不到自己刚写的值**（DAG 用入口快照）——中间结果必须拆成
+两个 action 靠相位边界传递（demo12 的 resolve/rewrite 两级就是这么来的）。
 
 ## 工具链操作坑（2026-09-30）
 
