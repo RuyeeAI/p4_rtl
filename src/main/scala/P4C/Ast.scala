@@ -80,6 +80,10 @@ object Ast {
     line: Int,
     isRuntime: Boolean = false,
     runtimeSize: Int = 0,
+    /** 外部表模块的查找延时范围（拍），`// p4c: table X runtime latency=<min>-<max>`。
+      * None = 未配置。生成侧写进 IR 通道注释（接口契约）并进报告。 */
+    latencyMin: Option[Int] = None,
+    latencyMax: Option[Int] = None,
   )
 
   final case class ControlParam(name: String, direction: String, typeName: String, line: Int) // direction: inout|in|out

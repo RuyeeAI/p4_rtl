@@ -231,6 +231,9 @@ int main(int argc, char** argv) {
   // 设了也会被覆盖，只会让意图混乱。
 
   xls::SchedulingOptions sched;
+  // 多 proc 网络（proc_instantiation 树）必须调度所有 proc，否则只调度 top、
+  // 子 proc 无调度表，ConvertToBlock 里 GetSchedule(子proc) 直接 out_of_range 崩溃。
+  sched.schedule_all_procs(true);
   if (stages.has_value()) {
     sched.pipeline_stages(*stages);
   }

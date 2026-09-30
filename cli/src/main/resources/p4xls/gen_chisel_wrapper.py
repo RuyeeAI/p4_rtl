@@ -57,8 +57,13 @@ class Port:
         return self.name == "rst"
 
 
-def parse_module(text: str, path: str):
-    """返回 (module 名, [Port])。要求恰好一个 module。"""
+def parse_module(text: str, path: str, top: str | None = None):
+    """返回 (module 名, [Port])。
+
+    top=None：要求文件恰好一个 module（旧口径）。
+    top 指定：多模块文件（多 proc 网络）里选 `module <top>(` 的那个 ——
+    BlackBox 包的是**顶层**端口；子 proc 模块在文件里仅作为参考。
+    """
     mods = []
     cur = None  # (name, [raw port lines])
     for lineno, line in enumerate(text.splitlines(), 1):
@@ -74,8 +79,14 @@ def parse_module(text: str, path: str):
             cur[1].append((lineno, line))
     if not mods:
         raise SystemExit(f"{path}: 未找到 module 声明")
-    if len(mods) > 1 or cur is not None:
-        raise SystemExit(f"{path}: 期望单 module（发现 {len(mods) + (1 if cur else 0)} 个）")
+    if top is not None:
+        mods = [m for m in mods if m[0] == top]
+        if not mods:
+            raise SystemExit(f"{path}: 未找到 top module '{top}'"
+                             f"（文件里有：{', '.join(m[0] for m in mods[:1])} 等）")
+    elif len(mods) > 1 or cur is not None:
+        raise SystemExit(f"{path}: 期望单 module（发现 {len(mods) + (1 if cur is not None else 0)} 个）"
+                         "；多模块文件请用 --top 指定顶层")
 
     name, raws = mods[0]
     ports = []
@@ -113,9 +124,9 @@ def pascal(stem: str) -> str:
     return joined
 
 
-def emit(verilog_path: pathlib.Path, out_dir: pathlib.Path) -> pathlib.Path:
+def emit(verilog_path: pathlib.Path, out_dir: pathlib.Path, top: str | None = None) -> pathlib.Path:
     text = verilog_path.read_text(encoding="utf-8")
-    mod_name, ports = parse_module(text, str(verilog_path))
+    mod_name, ports = parse_module(text, str(verilog_path), top)
     cls = pascal(verilog_path.stem)
 
     data_ports = [p for p in ports if not p.is_clk and not p.is_rst]
@@ -195,7 +206,10 @@ def self_check(scala_path: pathlib.Path, ports) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="XLS Verilog -> Chisel BlackBox wrapper（路线 3）")
     ap.add_argument("-o", "--out-dir", required=True, help="输出目录")
-    ap.add_argument("verilogs", nargs="+", help="XLS 生成的 .v 文件（每个单 top module）")
+    ap.add_argument("--top", default=None,
+                    help="多模块文件（多 proc 网络）里作为 BlackBox 的顶层 module 名；"
+                         "缺省要求文件恰好一个 module")
+    ap.add_argument("verilogs", nargs="+", help="XLS 生成的 .v 文件")
     args = ap.parse_args()
 
     out_dir = pathlib.Path(args.out_dir)
@@ -207,8 +221,8 @@ def main() -> int:
         if not vp.exists():
             print(f"❌ {v}: 文件不存在", file=sys.stderr)
             return 1
-        scala = emit(vp, out_dir)
-        name, ports = parse_module(vp.read_text(encoding="utf-8"), v)
+        scala = emit(vp, out_dir, args.top)
+        name, ports = parse_module(vp.read_text(encoding="utf-8"), v, args.top)
         self_check(scala, ports)
         data = sum(1 for p in ports if not p.is_clk and not p.is_rst)
         print(f"✅ {vp.name} (module {name}, {len(ports)} 端口) -> {scala} "

@@ -249,7 +249,7 @@ control Ingress(inout headers_t hdr, inout metadata_t meta) {
     // ---- 表 1：L2 目的 MAC 表（runtime：控制面可写）----
     // ⚠️ runtime 表只固化结构（key/actId/args 位宽），表项由控制面经写接口下发
     //（示例条目：48w0x001122334455 → l2_forward(4w1)，见 docs/Demo12-L2L3交换机.md §5）
-    // p4c: table mac_table runtime size=8
+    // p4c: table mac_table runtime size=8 latency=1-4
     table mac_table {
         key = {
             hdr.ethernet.dstAddr : exact;
@@ -265,7 +265,7 @@ control Ingress(inout headers_t hdr, inout metadata_t meta) {
 
     // ---- 表 2：L3 路由表（runtime；key 含预分类位 ⇒ 只有"上三层"的包才可能命中）----
     // 控制面下发表项示例：meta.isL3=1 + 目的 IP + 下一跳 MAC/端口
-    // p4c: table route_table runtime size=16
+    // p4c: table route_table runtime size=16 latency=2-8
     table route_table {
         key = {
             meta.isL3        : exact;   // 预分类门控（classify 写，不依赖任何表）

@@ -155,3 +155,56 @@ scripts/p4xls eval-ir out/flow/demo12/ir_fn/*action_rewrite.ir \
     --in meta.rtHit=1 --in meta.fwdType=2 --in hdr.ipv4.ttl=64 --in hdr.ipv4.hdrChecksum=0x1234 \
     --in meta.rtDstMac=0x00deadbeef01 --in meta.rtSrcMac=0x020000000001 --in meta.ipLen=100
 ```
+
+## v3 —— 模块化拆分（Parser / 表组+动作 / Deparser 各一个 module）+ FIFO 对齐 + 延时配置
+
+### 1. 生成代码的模块化（用户需求 ①）
+
+生成代码从「单 proc 单模块」升级为 **proc 网络（多模块 Verilog）**：
+
+```
+top proc Ingress_pipeline（连线壳：外部端口 + proc_instantiation + FIFO 通道）
+├── Ingress_pipeline__parser    解析（extract FSM）
+├── Ingress_pipeline__ctrl1     [classify 动作段]
+├── Ingress_pipeline__ctrl2     [查找组 g0 + resolve/rewrite/ttl_guard]
+└── Ingress_pipeline__deparser  报文重组（emit 序）
+```
+
+实现机制（全部经 XLS 官方 codegen 路径验证）：
+
+- **proc_instantiation**：Top 壳通过 `proc_instantiation i_xxx(<通道列表>, proc=子proc)`
+  组网，子 proc 按 interface 声明序绑定通道。
+- **proc 间通道**：Top 内 package 级 `chan ph_N(bits[W], id=.., kind=streaming, ops=send_receive,
+  flow_control=ready_valid, fifo_depth=N, strictness=proven_mutually_exclusive)` +
+  `chan_interface` 的 send/receive 成对引用（loopback 形态，**不进 Top 签名** ——
+  放进签名会让 interface 计数翻倍，verifier 报 `Duplicate channel reference`，实测踩过）。
+- **codegen**：`verilog_codegen_main` 加 `schedule_all_procs(true)`（否则子 proc 无调度表，
+  ConvertToBlock 在 GetSchedule 处 out_of_range 崩溃）。codegen 自动为每条 fifo 通道
+  实例化 `xls_fifo_wrapper`（Width/Depth/EnableBypass 参数化）并连接各模块。
+- parse 顺序：**子 proc 先于 Top**（`proc=` 引用走 TryGetProc，先定义后引用）。
+- 单段程序（无 runtime 组 / 无 deparser）退化为单 proc，与 v2 完全兼容（TB 对接不变）。
+
+### 2. 查找结果 FIFO 对齐（用户需求 ③）
+
+- proc 间通道 `fifo_depth=4`（`XlsBackend.FifoDepth`，可改）：PHV（包头+Meta）随
+  通道流动，上一段的处理结果在 FIFO 里排队，与下一段的查找节奏解耦 ——
+  慢表 stall 只占 FIFO，不丢包（ready_valid 背压 + XLS 流控插入 pass）。
+- 查找组内「同拍发 key / 全收齐 rsp 才进动作」的既有语义不变（结果天然对齐）。
+- demo12 实测 Verilog：5 模块 + 3 个 `xls_fifo_wrapper` 实例。
+
+### 3. 每表延时范围可配（用户需求 ②）
+
+指令扩展：`// p4c: table <名> runtime size=N latency=<min>-<max>`。
+
+- 语义：外部表模块对一次查找的响应延时范围（拍）。查找 FSM 是「一包在途」——
+  阻塞等 rsp，任意落在 [min, max] 的延时都正确，慢表只降吞吐不丢包。
+- 生成侧：① 校验（min ≥ 1 —— 组合表不存在；min ≤ max）；② 写进 IR 的
+  `// contract: table 'X' lookup latency min..max cycles` 注释（外部表模块接口契约）。
+- demo12：mac_table `latency=1-4`、route_table `latency=2-8`。
+
+### 4. 验证
+
+- p4flow 8 步全绿 ×7 样本（formal：demo12 等价 32 · 未决 0）。
+- demo12_verify 47/47（多 proc 拆分后 action 语义不变，fn dump 与 eval-ir 均不受影响）。
+- 已知小瑕疵：报告的「state 项/位 · 节点」统计在多 proc IR 上为 0（profileOf 的
+  状态提取按单 proc 头解析；查表口/II 计数正确），待后续适配。

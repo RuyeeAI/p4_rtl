@@ -493,7 +493,9 @@ object Flow {
           case Some((cmd0, cleanup)) =>
             Files.createDirectories(ctx.dirChisel)
             val py = sys.env.getOrElse("P4XLS_PYTHON", "python3")
-            val (rc, out) = sh(Seq(py) ++ cmd0 ++ Seq("-o", ctx.dirChisel.toString, v.toString), ctx.cfg.repoRoot)
+            // 多 proc 网络生成的 .v 含全部子模块 —— BlackBox 只包顶层，须传 --top
+            val (rc, out) = sh(Seq(py) ++ cmd0 ++
+              Seq("--top", ctx.topName, "-o", ctx.dirChisel.toString, v.toString), ctx.cfg.repoRoot)
             cleanup()
             if (rc == 0) {
               val n = Files.list(ctx.dirChisel).iterator().asScala.count(_.toString.endsWith(".scala"))

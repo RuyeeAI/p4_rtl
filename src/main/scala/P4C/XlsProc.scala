@@ -66,8 +66,13 @@ object XlsProc {
   /** 从类型字符串里取 `bits[N]` 的 N（[[Builder.sel]] 判断 cases 是否全覆盖用）。 */
   private val BitsWidthRe = """bits\[(\d+)\]""".r
 
-  /** proc 头的一条通道声明（同时决定端口与 `chan_interface` 行）。 */
-  final case class ChanDecl(name: String, direction: String, flowControl: String, width: Int)
+  /** proc 头的一条通道声明（同时决定端口与 `chan_interface` 行）。
+    *
+    * @param flopKind 通道端寄存器（none / flop / skid / zero_latency）。
+    *   `skid` = 2 深缓冲，用于 proc 间通道（A3：查找结果与包头的 FIFO 对齐）。
+    */
+  final case class ChanDecl(name: String, direction: String, flowControl: String, width: Int,
+                            flopKind: String = "none")
 
   /** proc 的一个 state 元素。 */
   final case class StateDecl(name: String, ty: String, init: String)
@@ -76,12 +81,18 @@ object XlsProc {
     *
     * 用法：`new Builder(pkg, procName, ids)` → 声明通道/state → 逐条发节点
     * → [[render]]。节点的引用只能来自本对象方法返回的名字。
+    *
+    * @param noState true = 无任何 state（连 tok 都没有）—— 仅用于
+    *   多 proc 网络的 `top proc`（纯连线壳，body 只有 proc_instantiation）。
     */
-  final class Builder(val pkg: String, val procName: String, ids: IdGen, top: Boolean = true) {
+  final class Builder(val pkg: String, val procName: String, ids: IdGen,
+                      top: Boolean = true, noState: Boolean = false) {
 
     private val chans = mutable.ArrayBuffer.empty[ChanDecl]
     private val states = mutable.ArrayBuffer.empty[StateDecl]
     private val body = mutable.ArrayBuffer.empty[String]
+    /** proc 实例化行（仅 Top 用）：`(实例名, 子 proc 名, 通道名列表)`。 */
+    private val procs = mutable.ArrayBuffer.empty[(String, String, Seq[String])]
     /** 已发射的节点：名字 → 类型字符串。
       *
       * 类型用于 [[sel]] 自动判断「cases 是否已覆盖 selector 的全部取值」——
@@ -90,16 +101,36 @@ object XlsProc {
 
     // ---------------- 声明 ----------------
 
-    /** 声明一条通道。`direction` ∈ {send, receive}；`flowControl` ∈ {valid_data, ready_valid}。 */
+    /** 声明一条通道。`direction` ∈ {send, receive}；`flowControl` ∈ {valid_data, ready_valid}。
+    *
+    * ⚠️ 同名**同方向**重复声明报错；同名**反方向**（send+receive 成对）合法 ——
+    * 这正是多 proc 网络 Top 壳的 loopback 通道形态（官方 round-trip 样本同款）。
+    */
     def declareChan(name: String, direction: String, width: Int,
-                    flowControl: String = "valid_data"): Unit = {
+                    flowControl: String = "valid_data", flopKind: String = "none"): Unit = {
       require(direction == "send" || direction == "receive",
         s"XlsProc.declareChan：direction 必须是 send/receive（got '$direction'）")
       require(flowControl == "valid_data" || flowControl == "ready_valid",
         s"XlsProc.declareChan：flowControl 必须是 valid_data/ready_valid（got '$flowControl'）")
-      require(!chans.exists(_.name == name), s"XlsProc.declareChan：通道名重复 '$name'")
-      chans += ChanDecl(name, direction, flowControl, width)
+      require(Seq("none", "flop", "skid", "zero_latency").contains(flopKind),
+        s"XlsProc.declareChan：flopKind 非法（got '$flopKind'）")
+      require(!chans.exists(c => c.name == name && c.direction == direction),
+        s"XlsProc.declareChan：通道名重复 '$name'（$direction）")
+      chans += ChanDecl(name, direction, flowControl, width, flopKind)
     }
+
+    /** loopback 通道：`name` → (width, flowControl, fifoDepth)。
+      * ⚠️ 不进签名（`<>`）——官方 loopback 形态里，chan 声明会自动创建
+      * send+receive 两条 interface；若再放进签名就会同方向各出现两次，
+      * verifier 报 `Duplicate channel reference`（实测踩过）。 */
+    private val loopbackChans = mutable.LinkedHashMap.empty[String, (Int, String, Int)]
+
+    /** 声明一条 **Top 壳内部**的 proc 间通道（package 级 `chan` 声明带
+      * `fifo_depth`，隐式创建 send+receive 两条 interface）。codegen 会为它
+      * 实例化 `xls_fifo_wrapper`（深度 = fifoDepth）—— 「查找结果 / 包头
+      * FIFO 对齐」的实现机制。 */
+    def declareLoopbackChan(name: String, width: Int, flowControl: String, fifoDepth: Int): Unit =
+      loopbackChans(name) = (width, flowControl, fifoDepth)
 
     /** 声明一个 state 元素（`tok` 由 [[render]] 自动加，不要在这里声明）。 */
     def declareState(name: String, ty: String, init: String = "0"): Unit = {
@@ -312,13 +343,28 @@ object XlsProc {
     /** 直接插入一行原始文本（逃生口：临时实验用，正常路径不要用）。 */
     def raw(line: String): Unit = emit(line)
 
+    /** 登记一个子 proc 实例化（仅 Top 壳用）。
+      *
+      * @param instName  实例名（IR 里 `proc_instantiation <instName>(...)`）
+      * @param procName  被实例化的 proc 名（`proc=`）
+      * @param chanNames 通道名列表（按子 proc interface 声明序，逐位置绑定）
+      */
+    def instantiateProc(instName: String, procName: String, chanNames: Seq[String]): Unit =
+      procs += ((instName, procName, chanNames))
+
     // ---------------- 渲染 ----------------
 
-    /** 渲染整个 proc 定义（不含 `package` 行 —— 由上层与 fn 一起拼）。 */
+    /** 渲染整个 proc 定义（不含 `package` 行 —— 由上层与 fn 一起拼）。
+      *
+      * 多 proc 网络扩展：
+      * - `noState=true`（Top 壳）：state 列表为空、无 `init=`，body 里对
+      *   「同名 send+receive 成对」的通道先发 package 级 `chan` 声明行，再发
+      *   两条 `chan_interface`，最后发各 `proc_instantiation`。
+      * - `flopKind` 非 none 的通道在 chan_interface 行上带 `flop_kind=`。 */
     def render: String = {
       val b = new StringBuilder
       val kw = if (top) "top proc" else "proc"
-      b ++= "#[initiation_interval(1)]\n"
+      if (!noState) b ++= "#[initiation_interval(1)]\n"
       b ++= s"$kw $procName<\n"
       // 通道端口：send → out，receive → in
       val portLines = chans.map { c =>
@@ -327,18 +373,37 @@ object XlsProc {
       }
       b ++= portLines.mkString(",\n") + "\n"
       b ++= ">(\n"
-      // state 形参：tok 固定第一
-      val stateLines = ("    tok: token" +: states.map(s => s"    ${s.name}: ${s.ty}"))
-      b ++= stateLines.mkString(",\n") + ",\n"
-      b ++= s"    init={${("token" +: states.map(_.init)).mkString(", ")}}\n"
-      b ++= ") {\n"
-      // chan_interface 声明
+      if (noState) {
+        b ++= ") {\n"
+      } else {
+        // state 形参：tok 固定第一
+        val stateLines = ("    tok: token" +: states.map(s => s"    ${s.name}: ${s.ty}"))
+        b ++= stateLines.mkString(",\n") + ",\n"
+        b ++= s"    init={${("token" +: states.map(_.init)).mkString(", ")}}\n"
+        b ++= ") {\n"
+      }
+      // loopback（proc 间）通道：package 级 chan 声明（带 fifo_depth）+ 隐式 send/receive
+      // 两条 interface —— **只出现在 body**，不进签名（否则 verifier 报 Duplicate）。
+      loopbackChans.foreach { case (name, (w, fc, depth)) =>
+        val id = ids.next()
+        b ++= s"  chan $name(bits[$w], id=$id, kind=streaming, ops=send_receive, " +
+          s"flow_control=$fc, fifo_depth=$depth, strictness=proven_mutually_exclusive)\n"
+        b ++= s"  chan_interface $name(direction=send, kind=streaming, " +
+          s"strictness=proven_mutually_exclusive, flow_control=$fc, flop_kind=none)\n"
+        b ++= s"  chan_interface $name(direction=receive, kind=streaming, " +
+          s"strictness=proven_mutually_exclusive, flow_control=$fc, flop_kind=none)\n"
+      }
+      // 签名通道的 chan_interface 属性行
       chans.foreach { c =>
         b ++= s"  chan_interface ${c.name}(direction=${c.direction}, kind=streaming, " +
-          s"strictness=proven_mutually_exclusive, flow_control=${c.flowControl}, flop_kind=none)\n"
+          s"strictness=proven_mutually_exclusive, flow_control=${c.flowControl}, " +
+          s"flop_kind=${c.flopKind})\n"
       }
       if (chans.nonEmpty) b ++= "\n"
       body.foreach(l => b ++= l + "\n")
+      procs.foreach { case (inst, pn, chanNames) =>
+        b ++= s"  proc_instantiation $inst(${chanNames.mkString(", ")}, proc=$pn)\n"
+      }
       b ++= "}\n"
       b.toString
     }

@@ -1,7 +1,7 @@
 package P4C
 
 import P4C.Ast._
-import P4C.XlsProc.{Builder, IdGen}
+import P4C.XlsProc.{Builder, ChanDecl, IdGen}
 
 import scala.collection.mutable
 
@@ -53,6 +53,10 @@ object XlsBackend {
 
   /** 报文窗口宽度，与 Chisel 线一致（`io.in = Input(UInt(512.W))`）。 */
   private val PktWindowBits = 512
+
+  /** proc 间 FIFO 通道的深度（用户需求：查找结果 / 包头 FIFO 对齐）。
+    * codegen 为每条 loopback chan 实例化一个 `xls_fifo_wrapper(depth)`。 */
+  private val FifoDepth = 4
 
   /** 一个 header 实例（struct 成员）。 */
   private final case class HdrInst(inst: String, ht: HeaderType, totalWidth: Int)
@@ -200,19 +204,44 @@ object XlsBackend {
     * @param pkg package 名（进 IR 的 `package` 行）
     * @param ids 全局 id 分配器（跨 fn/proc 共用，A2-0 硬规则）
     */
-  private def emitPipeline(
-    parserOpt: Option[ParserDecl], ctrlOpt: Option[ControlDecl],
-    prog: P4Program, pkg: String, ids: IdGen,
-  ): String = {
+  /** 段（多 proc 拆分的单元）。一个段 = 一个 XLS proc。
+    *
+    * - [[ParserSeg]]：报文解析（extract FSM + 通道收发）
+    * - [[CtrlSeg]]  ：一段连续的 control 语句（动作 / 静态表 / runtime 查找组）
+    * - [[DeparserSeg]]：报文重组（emit 序拼接，无 PHV state 的纯透传段）
+    */
+  private sealed trait Seg
+  private final case class ParserSeg(p: ParserDecl) extends Seg
+  private final case class CtrlSeg(
+    stmts: Seq[(Int, Ast.Stmt)],          // 段内语句（原始全局索引）
+    externInsts: Set[String],             // 段内用到的 extern 实例
+    rtTableNames: Set[String],            // 段内 apply 的 runtime 表
+  ) extends Seg
+  private final case class DeparserSeg(d: DeparserDecl) extends Seg
+
+  /** 一个 emit 的通道约定：输入通道名/宽 + 输出通道名/布局。 */
+  private final case class SegIo(inChan: String, inWidth: Int,
+                                 outChan: String, outSlots: Option[Seq[Slot]])
+  // outSlots = None ⇒ 输出全槽位拼接（PHV 透传）；Some(ls) ⇒ 按 ls 拼接（最终输出段）。
+
+  /** 槽位推导结果（emitSeg 与 Top 编排共用，消除两处重复推导的漂移）。 */
+  private final case class SlotTables(
+    insts: Seq[HdrInst],
+    validSlotOf: Map[String, Slot],
+    fieldSlotOf: Map[Seq[String], Slot],
+    metaSlotOf: Map[Seq[String], Slot],
+    hdrPhvSlots: Seq[Slot],
+    metaSlots: Seq[Slot],
+    phvSlots: Seq[Slot],
+    phvWidth: Int,
+    allSlots: Seq[Slot],
+  )
+
+  /** header 实例 / meta / PHV 布局推导（v2 的 1-4 节，提取成纯函数）。 */
+  private def slotTablesOf(prog: P4Program, parserOpt: Option[ParserDecl],
+                           ctrlOpt: Option[ControlDecl]): SlotTables = {
     val structs = prog.structs.map(st => st.name -> st).toMap
     val headerTypes = prog.headerTypes.map(ht => ht.name -> ht).toMap
-
-    // ---- 0) 前置检查 ----
-    ctrlOpt.foreach { c =>
-      if (c.applyBody.isEmpty) throw new P4Error(s"XlsBackend：control '${c.name}' 的 apply 体为空")
-    }
-
-    // ---- 1) header 实例：来源是 parser 的 out struct，无 parser 时取 control 里含 header 的 struct 参数 ----
     val hdrStruct: StructType = parserOpt match {
       case Some(p) =>
         val o = p.params.find(_.direction == "out").getOrElse(
@@ -220,7 +249,8 @@ object XlsBackend {
         structs.getOrElse(o.typeName, throw new P4Error(
           s"XlsBackend：parser '${p.name}' 的 out 参数类型 '${o.typeName}' 不是 struct"))
       case None =>
-        val c = ctrlOpt.get
+        val c = ctrlOpt.getOrElse(throw new P4Error(
+          "XlsBackend：内部错误 —— deparser/纯 control 段缺 control 引用"))
         c.params.flatMap { p =>
           structs.get(p.typeName)
             .filter(st => st.members.exists(m => !m.isBits && headerTypes.contains(m.typeName)))
@@ -233,8 +263,6 @@ object XlsBackend {
       HdrInst(m.name, ht, ht.fields.map(_.width).sum)
     }
     if (insts.isEmpty) throw new P4Error(s"XlsBackend：'${hdrStruct.name}' 里没有 header 成员")
-
-    // ---- 2) meta 字段：control 参数里「成员全是 bits」的 struct ----
     val metaSlots: Seq[Slot] = ctrlOpt.toSeq.flatMap { c =>
       c.params.flatMap { p =>
         structs.get(p.typeName) match {
@@ -244,8 +272,6 @@ object XlsBackend {
         }
       }
     }
-
-    // ---- 3) 槽位表 ----
     val validSlotOf: Map[String, Slot] = insts.map { hi =>
       hi.inst -> Slot(s"${hi.inst}_v", Seq(hi.inst, "#valid"), 1)
     }.toMap
@@ -253,6 +279,35 @@ object XlsBackend {
       hi.ht.fields.map(f => Seq(hi.inst, f.name) -> Slot(s"${hi.inst}_${f.name}", Seq(hi.inst, f.name), f.width))
     }.toMap
     val metaSlotOf: Map[Seq[String], Slot] = metaSlots.map(s => s.key -> s).toMap
+    val hdrPhvSlots: Seq[Slot] = insts.flatMap { hi =>
+      Seq(validSlotOf(hi.inst)) ++ hi.ht.fields.map(f => fieldSlotOf(Seq(hi.inst, f.name)))
+    }
+    val phvSlots: Seq[Slot] = hdrPhvSlots ++ metaSlots
+    val allSlots: Seq[Slot] = (hdrPhvSlots ++ metaSlots).distinct
+    val dupState = allSlots.groupBy(_.stateName).filter(_._2.size > 1).keys.toSeq
+    if (dupState.nonEmpty)
+      throw new P4Error(s"XlsBackend：展平后 state 重名：${dupState.mkString(", ")}")
+    SlotTables(insts, validSlotOf, fieldSlotOf, metaSlotOf, hdrPhvSlots, metaSlots,
+      phvSlots, phvSlots.map(_.width).sum, allSlots)
+  }
+
+  private def emitSeg(
+    seg: Seg,
+    segName: String,
+    io: SegIo,
+    isTop: Boolean,
+    ctrlOpt: Option[ControlDecl],
+    prog: P4Program, pkg: String, ids: IdGen,
+  ): String = {
+    val parserOpt = seg match { case ParserSeg(p) => Some(p); case _ => None }
+    val deparserOpt = seg match { case DeparserSeg(d) => Some(d); case _ => None }
+    val structs = prog.structs.map(st => st.name -> st).toMap
+    val headerTypes = prog.headerTypes.map(ht => ht.name -> ht).toMap
+
+    // ---- 1-4) header 实例 / meta / 槽位表 / PHV 布局（共享推导）----
+    val st = slotTablesOf(prog, parserOpt, ctrlOpt)
+    val SlotTables(insts, validSlotOf, fieldSlotOf, metaSlotOf, hdrPhvSlots, metaSlots,
+      phvSlots, phvWidth, allSlots) = st
 
     /** AST 路径 → 槽位。两段 = meta 字段（`param.member`），三段 = header 字段（`param.inst.field`）。 */
     def slotForPath(path: Seq[String], line: Int): Slot = path match {
@@ -263,38 +318,16 @@ object XlsBackend {
           "（header 字段须写 param.instance.field，meta 字段须写 param.member）")
     }
 
-    // ---- 4) PHV 布局：header 按声明序拼 (valid, 字段…)，再拼 meta ----
-    val hdrPhvSlots: Seq[Slot] = insts.flatMap { hi =>
-      Seq(validSlotOf(hi.inst)) ++ hi.ht.fields.map(f => fieldSlotOf(Seq(hi.inst, f.name)))
-    }
-    val phvSlots: Seq[Slot] = hdrPhvSlots ++ metaSlots
-    val phvWidth = phvSlots.map(_.width).sum
-    val allSlots: Seq[Slot] = (hdrPhvSlots ++ metaSlots).distinct
-    val dupState = allSlots.groupBy(_.stateName).filter(_._2.size > 1).keys.toSeq
-    if (dupState.nonEmpty)
-      throw new P4Error(s"XlsBackend：展平后 state 重名：${dupState.mkString(", ")}")
-
-    // ---- 4b) 对外输出布局：有 deparser ⇒ 按 emit 声明序拼接各 header 的 (valid, 字段…)，
-    // **不含 metadata**（metadata 是内部决策信息，不是报文）；通道名 pkt_out。
-    // 无 deparser ⇒ 退化为 PHV 全量拼接（headers + metadata），通道名 phv_out（既有行为）。
+    // ---- 4b) 输出布局：由段约定（io.outSlots）决定。
+    //   Some(ls) ⇒ 最终输出段（有 deparser：emit 序拼接，**不含 metadata**；
+    //             无 deparser：PHV 全量拼接，通道名 phv_out —— 既有行为）。
+    //   None     ⇒ 中间段：PHV 全量透传（phvSlots）。
     // 子集语义：无条件 emit —— 没有 isValid/变长，invalid header 输出全 0（valid=0）。
-    if (prog.deparser.isDefined && parserOpt.isEmpty)
+    if (prog.deparser.isDefined && parserOpt.isEmpty && ctrlOpt.isEmpty)
       throw new P4Error("XlsBackend：deparser 依赖 parser 产出的报文窗口，纯 control 程序不支持 deparser")
-    val outSlots: Seq[Slot] = prog.deparser match {
-      case Some(d) =>
-        val seen = scala.collection.mutable.LinkedHashSet.empty[Slot]
-        d.emits.foreach { e =>
-          val inst = e.path.last
-          val hi = insts.find(_.inst == inst).getOrElse(throw new P4Error(
-            s"行 ${e.line}：deparser emit 引用了未知的 header 实例 '$inst'"))
-          seen += validSlotOf(hi.inst)
-          hi.ht.fields.foreach(f => seen += fieldSlotOf(Seq(hi.inst, f.name)))
-        }
-        seen.toSeq
-      case None => phvSlots
-    }
+    val outSlots: Seq[Slot] = io.outSlots.getOrElse(phvSlots)
+    val outChan = io.outChan
     val outWidth = outSlots.map(_.width).sum
-    val outChan = if (prog.deparser.isDefined) "pkt_out" else "phv_out"
 
     // ---- 5) 相位编码 ----
     val mainStates: Seq[String] =
@@ -307,72 +340,21 @@ object XlsBackend {
     val pCount = mainStates.length
     val hasParser = parserOpt.isDefined
     val ctrlBase = if (pCount > 0) pCount else 1
-    val stmts = ctrlOpt.map(_.applyBody).getOrElse(Seq.empty)
-    // ---- 5a-2) 并行查找组（lookup-group）：静态校验 + 相位合并 ----
-    // 组内 runtime 表**同拍**发 key、同拍收 rsp 并应用 —— 表间无依赖换查找延时省 N−1 拍。
-    // 违反下列任一约束即 P4Error（显式拒绝，绝不静默降级为串行）。
+    // 段内语句（CtrlSeg 携带；parser/deparser 段为空）
+    val stmts: Seq[Ast.Stmt] = seg match {
+      case CtrlSeg(ss, _, _) => ss.map(_._2)
+      case _                 => Seq.empty
+    }
+    // ---- 5a-2) 并行查找组：静态校验在 emitProgram 全局做（组的合法性跨段一致）；
+    // 这里只保留段的映射与局部索引。op 契约表（tableOfAll/actionOfAll）供 11 节发射用。
     val tableOfAll: Map[String, Ast.TableDecl] =
       ctrlOpt.map(_.tables.map(t => t.name -> t).toMap).getOrElse(Map.empty)
     val actionOfAll: Map[String, Ast.ActionDecl] =
       ctrlOpt.map(_.actions.map(a => a.name -> a).toMap).getOrElse(Map.empty)
-
-    /** action 的 PHV 写集 = body 里 Assign 的路径（extern 写不算 —— 状态单元不是查找依赖）。 */
-    def writeSet(a: Ast.ActionDecl): Set[Seq[String]] =
-      a.body.collect { case Ast.Assign(p, _, _) => p.toSeq }.toSet
-
-    /** 表全部 action 的写集并集。 */
-    def tableWriteSet(t: Ast.TableDecl): Set[Seq[String]] =
-      t.actions.flatMap(an => actionOfAll.get(an).map(writeSet).getOrElse(Set.empty)).toSet
-
-    /** 表的 key 读集（key 只支持字段路径）。 */
-    def keyReadSet(t: Ast.TableDecl): Set[Seq[String]] =
-      t.keys.collect { case Ast.KeyElem(Ast.Name(p, _), _, _) => p.toSeq }.toSet
-
-    // 每张表至多属一个组
-    prog.lookupGroups.flatMap(_.tables).groupBy(identity)
-      .filter(_._2.size > 1).keys.foreach { tn =>
-        throw new P4Error(s"XlsBackend：表 '$tn' 出现在多个 lookup-group 里（每张表至多属一组）")
-      }
-    prog.lookupGroups.foreach { g =>
-      // 组内表必须都是 runtime 表（静态融合表没有 key/rsp 通道，并行无意义）
-      g.tables.foreach { tn =>
-        tableOfAll.get(tn) match {
-          case Some(t) if t.isRuntime => ()
-          case Some(_) => throw new P4Error(
-            s"行 ${g.line}：lookup-group '${g.name}' 的成员表 '$tn' 不是 runtime 表" +
-              "（静态融合表是纯组合逻辑、无 key/rsp 通道，并行无意义）")
-          case None => throw new P4Error(
-            s"行 ${g.line}：lookup-group '${g.name}' 引用了未声明的表 '$tn'")
-        }
-      }
-      // 组内表必须在 apply 里相邻排列（否则夹在中间的语句时序会落在组的查找相位之间）
-      val idxs = stmts.zipWithIndex.collect {
-        case (Ast.TableApply(n, _), k) if g.tables.contains(n) => k
-      }
-      if (idxs.size != g.tables.size)
-        throw new P4Error(s"行 ${g.line}：lookup-group '${g.name}' 的成员表没有全部在 apply 里 apply")
-      if (idxs.nonEmpty && idxs.max - idxs.min + 1 != idxs.size)
-        throw new P4Error(s"行 ${g.line}：lookup-group '${g.name}' 的成员表在 apply 里不相邻" +
-          "（并行组必须连续排列，否则组间语句的相位会落在查找/应答之间）")
-      // 两两校验：先声明者的写集 vs 后声明者的 key 读集（并行 ⇒ 读到的是进入该拍时的快照）
-      g.tables.combinations(2).foreach {
-        case Seq(aName, bName) =>
-          val (ta, tb) = (tableOfAll(aName), tableOfAll(bName))
-          val wA = tableWriteSet(ta)
-          val clashKey = wA.intersect(keyReadSet(tb))
-          if (clashKey.nonEmpty)
-            throw new P4Error(
-              s"行 ${g.line}：lookup-group '${g.name}'：表 '$aName' 的写集与 '$bName' 的 key 读集相交" +
-                s"（${clashKey.map(_.mkString(".")).mkString(", ")}）—— 并行查找会让 '$bName' 读到旧值，请改回串行")
-          val clashW = wA.intersect(tableWriteSet(tb))
-          if (clashW.nonEmpty)
-            throw new P4Error(
-              s"行 ${g.line}：lookup-group '${g.name}'：表 '$aName' 与 '$bName' 的 action 写集相交" +
-                s"（${clashW.map(_.mkString(".")).mkString(", ")}）—— 同拍应用无法定义覆盖次序")
-      }
-    }
     val groupOfTable: Map[String, Ast.LookupGroup] =
       prog.lookupGroups.flatMap(g => g.tables.map(t => t -> g)).toMap
+    // ⚠️ firstStmtOfGroup 用**段内局部索引**：并行组的相位合并是段内概念
+    //（组的校验已在全局做过，这里只做映射）。
     val firstStmtOfGroup: Map[String, Int] = {
       val m = scala.collection.mutable.LinkedHashMap.empty[String, Int]
       stmts.zipWithIndex.foreach { case (stmt, k) => stmt match {
@@ -388,7 +370,11 @@ object XlsBackend {
     // p0_is_phRsp 拍有效（其余拍被门控清零），下一拍应用时数据已经没了。
     // 应用是纯组合 sel，与接收同拍毫无问题。
     // 并行组：**首表**占 2 拍，组内其余表 0 拍（base 与首表相同 ⇒ 同拍发 key/收 rsp）。
-    val rtNames = ctrlOpt.toSeq.flatMap(_.tables).filter(_.isRuntime).map(_.name).toSet
+    // rtNames = **本段** apply 的 runtime 表（段化后表通道只属于所属段）
+    val rtNames: Set[String] = seg match {
+      case CtrlSeg(_, _, rt) => rt
+      case _                 => Set.empty
+    }
     val stmtLens: Seq[Int] = stmts.zipWithIndex.map { case (stmt, k) =>
       stmt match {
         case TableApply(n, _) if rtNames.contains(n) =>
@@ -434,26 +420,27 @@ object XlsBackend {
       }.map(rl => rl.name -> rl)
     }.toMap
 
-    // ---- 6) 声明 ----
-    val procName = (parserOpt, ctrlOpt) match {
-      case (Some(p), None) => s"${p.name}_parser"
-      case (None, Some(c)) => s"${c.name}_control"
-      case (Some(_), Some(c)) => s"${c.name}_pipeline"
-      case _ => throw new P4Error("XlsBackend：程序里既没有 parser 也没有 control")
+    // ---- 6) 声明（通道清单与 Top 绑定共用 segChans，保证顺序一致）----
+    val inChan = io.inChan
+    val inWidth = io.inWidth
+    val b = new Builder(pkg, segName, ids, top = isTop)
+    segChans(seg, io, ctrlOpt, prog, phvWidth).foreach { c =>
+      b.declareChan(c.name, c.direction, c.width, c.flowControl, c.flopKind)
     }
-    val inChan = if (hasParser) "pkt_in" else "phv_in"
-    val inWidth = if (hasParser) PktWindowBits else phvWidth
-    val b = new Builder(pkg, procName, ids)
-    b.declareChan(inChan, "receive", inWidth, "valid_data")
-    b.declareChan(outChan, "send", outWidth, "ready_valid")
     b.declareState("phase", bitsTy(pw), "0")
     if (hasParser) b.declareState("pkt", bitsTy(PktWindowBits), "0")
     allSlots.foreach(s => b.declareState(s.stateName, bitsTy(s.width), "0"))
 
     // ---- 6b) extern 状态：每个实例一个**数组** state（A2-5b 前置实验定案：方案 a）。
     // 与 PHV 槽位的本质区别：extern **跨包持久**，不参与相位 0 的清零。
+    // 段化后只声明**本段用到**的 extern（归属段的静态划分，见 emitProgram）。
     case class ExtState(name: String, inst: String, width: Int, size: Int)
-    val extStates: Seq[ExtState] = ctrlOpt.toSeq.flatMap(_.externs).map { e =>
+    val extInsts: Set[String] = seg match {
+      case CtrlSeg(_, insts2, _) => insts2
+      case _                     => Set.empty
+    }
+    val extStates: Seq[ExtState] = ctrlOpt.toSeq.flatMap(_.externs)
+      .filter(e => extInsts.contains(e.name)).map { e =>
       val kind = e.kind match {
         case "Register" => "reg"
         case "Counter" => "cnt"
@@ -474,13 +461,19 @@ object XlsBackend {
     // 优化掉（A2-5b 实测：demo5 的 counter 整个消失）。走 valid_data（无背压）
     // 且不带谓词——观察口尽力而为，绝不反压主数据通路。
     // 布局：元素 0 在最高位（与 PHV「先声明者在高位」同原则）。
-    extStates.foreach(es =>
-      b.declareChan(s"ex_${es.inst}", "send", es.width * es.size, "valid_data"))
+    // extern 观察通道（ex_*）与 runtime 表通道（tbl_*_key/rsp）的声明已并入
+    // segChans（与 Top 绑定共用同一份清单，见 emitProgram）。
 
-    // runtime 表的通道对（A4：key/rsp 都走 valid_data，无背压）
-    rtLayouts.values.foreach { rl =>
-      b.declareChan(s"tbl_${rl.name}_key", "send", rl.keyBits, "valid_data")
-      b.declareChan(s"tbl_${rl.name}_rsp", "receive", 1 + rl.actW + rl.argW, "valid_data")
+    // ---- 6d) 表延时契约注释：把每张 runtime 表的 latency 配置写进 IR，
+    // 作为对外部表模块的接口契约（XLS parser 忽略注释，纯文档用途）。
+    ctrlOpt.foreach { c =>
+      c.tables.filter(t => rtNames.contains(t.name)).foreach { t =>
+        (t.latencyMin, t.latencyMax) match {
+          case (Some(mn), Some(mx)) =>
+            b.raw(s"// contract: table '${t.name}' lookup latency ${mn}..${mx} cycles (external module)")
+          case _ => ()
+        }
+      }
     }
 
     // ---- 7) 读状态 + 相位判据 ----
@@ -862,7 +855,164 @@ object XlsBackend {
   // 顶层入口
   // ------------------------------------------------------------------
 
-  /** 整个程序 → XLS IR 文本。
+  /** lookup-group 的静态校验（全局，跨段一致）。
+    * 违反任一约束即 P4Error（显式拒绝，绝不静默降级为串行）。 */
+  private def validateLookupGroups(prog: P4Program, ctrlOpt: Option[ControlDecl],
+                                   globalStmts: Seq[Ast.Stmt]): Unit = {
+    val tableOfAll: Map[String, Ast.TableDecl] =
+      ctrlOpt.map(_.tables.map(t => t.name -> t).toMap).getOrElse(Map.empty)
+    val actionOfAll: Map[String, Ast.ActionDecl] =
+      ctrlOpt.map(_.actions.map(a => a.name -> a).toMap).getOrElse(Map.empty)
+
+    /** action 的 PHV 写集 = body 里 Assign 的路径（extern 写不算 —— 状态单元不是查找依赖）。 */
+    def writeSet(a: Ast.ActionDecl): Set[Seq[String]] =
+      a.body.collect { case Ast.Assign(p, _, _) => p.toSeq }.toSet
+
+    /** 表全部 action 的写集并集。 */
+    def tableWriteSet(t: Ast.TableDecl): Set[Seq[String]] =
+      t.actions.flatMap(an => actionOfAll.get(an).map(writeSet).getOrElse(Set.empty)).toSet
+
+    /** 表的 key 读集（key 只支持字段路径）。 */
+    def keyReadSet(t: Ast.TableDecl): Set[Seq[String]] =
+      t.keys.collect { case Ast.KeyElem(Ast.Name(p, _), _, _) => p.toSeq }.toSet
+
+    // 每张表至多属一个组
+    prog.lookupGroups.flatMap(_.tables).groupBy(identity)
+      .filter(_._2.size > 1).keys.foreach { tn =>
+        throw new P4Error(s"XlsBackend：表 '$tn' 出现在多个 lookup-group 里（每张表至多一组）")
+      }
+    prog.lookupGroups.foreach { g =>
+      // 组内表必须都是 runtime 表（静态融合表没有 key/rsp 通道，并行无意义）
+      g.tables.foreach { tn =>
+        tableOfAll.get(tn) match {
+          case Some(t) if t.isRuntime => ()
+          case Some(_) => throw new P4Error(
+            s"行 ${g.line}：lookup-group '${g.name}' 的成员表 '$tn' 不是 runtime 表" +
+              "（静态融合表是纯组合逻辑、无 key/rsp 通道，并行无意义）")
+          case None => throw new P4Error(
+            s"行 ${g.line}：lookup-group '${g.name}' 引用了未声明的表 '$tn'")
+        }
+      }
+      // 组内表必须在 apply 里相邻排列（否则夹在中间的语句时序会落在组的查找相位之间）
+      val idxs = globalStmts.zipWithIndex.collect {
+        case (Ast.TableApply(n, _), k) if g.tables.contains(n) => k
+      }
+      if (idxs.size != g.tables.size)
+        throw new P4Error(s"行 ${g.line}：lookup-group '${g.name}' 的成员表没有全部在 apply 里 apply")
+      if (idxs.nonEmpty && idxs.max - idxs.min + 1 != idxs.size)
+        throw new P4Error(s"行 ${g.line}：lookup-group '${g.name}' 的成员表在 apply 里不相邻" +
+          "（并行组必须连续排列，否则组间语句的相位会落在查找/应答之间）")
+      // 两两校验：先声明者的写集 vs 后声明者的 key 读集（并行 ⇒ 读到的是进入该拍时的快照）
+      g.tables.combinations(2).foreach {
+        case Seq(aName, bName) =>
+          val (ta, tb) = (tableOfAll(aName), tableOfAll(bName))
+          val wA = tableWriteSet(ta)
+          val clashKey = wA.intersect(keyReadSet(tb))
+          if (clashKey.nonEmpty)
+            throw new P4Error(
+              s"行 ${g.line}：lookup-group '${g.name}'：表 '$aName' 的写集与 '$bName' 的 key 读集相交" +
+                s"（${clashKey.map(_.mkString(".")).mkString(", ")}）—— 并行查找会让 '$bName' 读到旧值，请改回串行")
+          val clashW = wA.intersect(tableWriteSet(tb))
+          if (clashW.nonEmpty)
+            throw new P4Error(
+              s"行 ${g.line}：lookup-group '${g.name}'：表 '$aName' 与 '$bName' 的 action 写集相交" +
+                s"（${clashW.map(_.mkString(".")).mkString(", ")}）—— 同拍应用无法定义覆盖次序")
+      }
+    }
+  }
+
+  /** 扫描一个 action 用到的 extern 实例（段归属用）。
+    * extern 引用形态：`<inst>.read(<idx>)`（Call 双段路径）与
+    * `<inst>.write(<idx>, v)` / `<inst>.count(<idx>)`（MethodCall 语句）。 */
+  private def externsOfAction(a: Ast.ActionDecl, externNames: Set[String]): Set[String] = {
+    val s = scala.collection.mutable.LinkedHashSet.empty[String]
+    def walkExpr(e: Expr): Unit = e match {
+      case Call(path, args, _) =>
+        if (path.length == 2 && externNames.contains(path.head)) s += path.head
+        args.foreach(walkExpr)
+      case Slice(e2, _, _, _) => walkExpr(e2)
+      case Cast(_, e2, _) => walkExpr(e2)
+      case Ternary(c, t, f, _) => walkExpr(c); walkExpr(t); walkExpr(f)
+      case Un(_, e2, _) => walkExpr(e2)
+      case Bin(_, l, r, _) => walkExpr(l); walkExpr(r)
+      case _ => ()
+    }
+    a.body.foreach {
+      case Assign(_, e, _) => walkExpr(e)
+      case MethodCall(inst, _, args, _) =>
+        if (externNames.contains(inst)) s += inst
+        args.foreach(walkExpr)
+      case _ => ()
+    }
+    s.toSet
+  }
+
+  /** 表动作集合用到的 extern 实例。 */
+  private def externsOfTable(t: Ast.TableDecl, actionOf: Map[String, Ast.ActionDecl],
+                             externNames: Set[String]): Set[String] =
+    t.actions.flatMap(an => actionOf.get(an).map(externsOfAction(_, externNames)).getOrElse(Set.empty)).toSet
+
+  /** runtime 表的接口布局（emitSeg 与 Top 编排共用）。 */
+  private final case class RtLayout(name: String, keyBits: Int, actW: Int, argW: Int,
+                                    argOffsets: Map[String, Seq[(String, Int, Int)]])
+
+  /** 一个段的 interface 通道清单（emitSeg 声明与 Top 绑定共用同一份，保证顺序一致）。
+    * 顺序：输入、输出、extern 观察口、表 key/rsp。 */
+  private def segChans(
+    seg: Seg, io: SegIo, ctrlOpt: Option[ControlDecl],
+    prog: P4Program, phvWidth: Int,
+  ): Seq[ChanDecl] = {
+    val inFc = if (io.inChan.startsWith("ph_")) "ready_valid" else "valid_data"
+    val in = ChanDecl(io.inChan, "receive", inFc, io.inWidth)
+    val outW = io.outSlots.map(_.map(_.width).sum).getOrElse(phvWidth)
+    val out = ChanDecl(io.outChan, "send", "ready_valid", outW)
+    val exts: Seq[ChanDecl] = seg match {
+      case CtrlSeg(_, externInsts, _) => ctrlOpt.toSeq.flatMap { c =>
+        c.externs.filter(e => externInsts.contains(e.name))
+          .map(e => ChanDecl(s"ex_${e.name}", "send", "valid_data", e.width * e.size))
+      }
+      case _ => Seq.empty
+    }
+    val tbls: Seq[ChanDecl] = seg match {
+      case CtrlSeg(_, _, rtNames) => ctrlOpt.toSeq.flatMap { c =>
+        val actByName = c.actions.map(a => a.name -> a).toMap
+        val st = slotTablesOf(prog, seg match {
+          case ParserSeg(p) => Some(p); case _ => None
+        }, ctrlOpt)
+        c.tables.filter(t => rtNames.contains(t.name) && t.isRuntime).flatMap { t =>
+          val acts = t.actions.map(an => actByName.getOrElse(an,
+            throw new P4Error(s"table '${t.name}'：引用了未知 action '$an'")))
+          val actW = math.max(1, BigInt(math.max(0, acts.size - 1)).bitLength)
+          val argW = acts.map(a => a.params.map(_.width).sum).foldLeft(0)(math.max)
+          val keyBits = t.keys.map { ke => ke.expr match {
+            case Name(p, _) =>
+              // key 字段宽度：meta 两段路径或 header 三段路径（复用槽位表推导）
+              p match {
+                case Seq(_, m, f) if st.fieldSlotOf.contains(Seq(m, f)) => st.fieldSlotOf(Seq(m, f)).width
+                case Seq(pp, m) if st.metaSlotOf.contains(Seq(pp, m)) => st.metaSlotOf(Seq(pp, m)).width
+                case _ => throw new P4Error(s"runtime 表 key 路径 '${p.mkString(".")}' 无对应槽位")
+              }
+            case other => throw new P4Error(
+              s"runtime 表 key 只支持字段路径（got ${other.getClass.getSimpleName}）")
+          } }.sum
+          Seq(ChanDecl(s"tbl_${t.name}_key", "send", "valid_data", keyBits),
+              ChanDecl(s"tbl_${t.name}_rsp", "receive", "valid_data", 1 + actW + argW))
+        }
+      }
+      case _ => Seq.empty
+    }
+    Seq(in, out) ++ exts ++ tbls
+  }
+
+  /** 整个程序 → XLS IR 文本（多 proc 网络：Parser 段 / 查找段×N / Deparser 段 + Top 壳）。
+    *
+    * 段划分规则（用户需求：Parser、Deparser、每个表组及其 Action 各一个 module）：
+    * - parser 段、deparser 段各一个 proc；
+    * - control 语句在每个 runtime 查找组的首语句处切段 —— 组连同其后的动作
+    *   归入同一段（组的查找结果由同段动作消费，天然对齐）；
+    * - 段数 = 1 时退化为单 proc（与 v2 完全兼容，外部通道直接在该 proc 上）；
+    * - 段数 > 1 时生成 Top 壳：proc 间通道 ready_valid + `flop_kind=skid`
+    *   （2 深缓冲 —— 查找结果与包头/Meta 对齐后进动作，慢表 stall 不丢包）。
     *
     * @param pkg        package 名（进 IR 的 `package` 行）
     * @param sourceName 源文件名（写进注释）
@@ -882,8 +1032,157 @@ object XlsBackend {
     if (prog.controls.length > 1)
       throw new P4Error(s"XlsBackend：暂不支持多个 control（有 ${prog.controls.length} 个）")
 
-    b ++= emitPipeline(prog.parsers.headOption, prog.controls.headOption, prog, pkg, ids)
-    b ++= "\n"
-    b.toString
+    val parserOpt = prog.parsers.headOption
+    val ctrlOpt = prog.controls.headOption
+    ctrlOpt.foreach { c =>
+      if (c.applyBody.isEmpty) throw new P4Error(s"XlsBackend：control '${c.name}' 的 apply 体为空")
+    }
+
+    // ---- 全局组校验（段内只保留映射） ----
+    val globalStmts = ctrlOpt.map(_.applyBody).getOrElse(Seq.empty)
+    validateLookupGroups(prog, ctrlOpt, globalStmts)
+
+    // ---- 段归属：每条语句用到哪些 extern ----
+    val actionOfAll: Map[String, Ast.ActionDecl] =
+      ctrlOpt.map(_.actions.map(a => a.name -> a).toMap).getOrElse(Map.empty)
+    val tableOfAll: Map[String, Ast.TableDecl] =
+      ctrlOpt.map(_.tables.map(t => t.name -> t).toMap).getOrElse(Map.empty)
+    val externNames: Set[String] =
+      ctrlOpt.map(_.externs.map(_.name).toSet).getOrElse(Set.empty)
+    def stmtExterns(st: Ast.Stmt): Set[String] = st match {
+      case ActionCall(n, _, _) =>
+        actionOfAll.get(n).map(externsOfAction(_, externNames)).getOrElse(Set.empty)
+      case TableApply(n, _) =>
+        tableOfAll.get(n).map(externsOfTable(_, actionOfAll, externNames)).getOrElse(Set.empty)
+      case MethodCall(inst, _, _, _) => Set(inst)
+      case _ => Set.empty
+    }
+
+    // ---- 段划分 ----
+    // control 段边界：每个 runtime 组的首语句前切段（组连同其后的动作同段）。
+    val groupOfTable: Map[String, Ast.LookupGroup] =
+      prog.lookupGroups.flatMap(g => g.tables.map(t => t -> g)).toMap
+    val groupFirstStmt: Set[Int] = {
+      val first = scala.collection.mutable.LinkedHashSet.empty[Int]
+      val seenGroups = scala.collection.mutable.LinkedHashSet.empty[String]
+      globalStmts.zipWithIndex.foreach { case (stmt, k) => stmt match {
+        case TableApply(n, _) => groupOfTable.get(n).foreach { g =>
+          if (!seenGroups.contains(g.name)) { seenGroups += g.name; first += k }
+        }
+        case _ =>
+      }}
+      first.toSet
+    }
+    val ctrlSegs: Seq[CtrlSeg] = {
+      val acc = scala.collection.mutable.ArrayBuffer.empty[scala.collection.mutable.ArrayBuffer[(Int, Ast.Stmt)]]
+      var cur = scala.collection.mutable.ArrayBuffer.empty[(Int, Ast.Stmt)]
+      globalStmts.zipWithIndex.foreach { case (stmt, k) =>
+        if (groupFirstStmt.contains(k) && cur.nonEmpty) { acc += cur; cur = scala.collection.mutable.ArrayBuffer.empty }
+        cur += ((k, stmt))
+      }
+      if (cur.nonEmpty) acc += cur
+      acc.toSeq.map { ss =>
+        val exts = ss.flatMap { case (_, st) => stmtExterns(st) }.toSet
+        val rts = ss.collect { case (_, TableApply(n, _)) if tableOfAll.get(n).exists(_.isRuntime) => n }.toSet
+        CtrlSeg(ss.toSeq, exts, rts)
+      }
+    }
+
+    // ---- 段序列 ----
+    val segs: Seq[Seg] =
+      parserOpt.map(ParserSeg).toSeq ++ ctrlSegs ++ prog.deparser.map(DeparserSeg).toSeq
+    if (segs.isEmpty) throw new P4Error("XlsBackend：没有可发射的段")
+
+    // ---- 段命名（Top 壳沿用 v2 的模块名，TB/下游对接不变）----
+    val topName = (parserOpt, ctrlOpt) match {
+      case (Some(p), None) => s"${p.name}_parser"
+      case (None, Some(c)) => s"${c.name}_control"
+      case (Some(_), Some(c)) => s"${c.name}_pipeline"
+      case _ => throw new P4Error("XlsBackend：程序里既没有 parser 也没有 control")
+    }
+    val segNames: Seq[String] =
+      if (segs.length == 1) Seq(topName)
+      else segs.zipWithIndex.map {
+        case (ParserSeg(_), _) => s"${topName}__parser"
+        case (DeparserSeg(_), _) => s"${topName}__deparser"
+        case (_, i) => s"${topName}__ctrl$i"
+      }
+
+    // ---- PHV 宽度（与 v2 同口径：全槽位拼接；共享推导避免漂移）----
+    val phvWidth = slotTablesOf(prog, parserOpt, ctrlOpt).phvWidth
+
+    // ---- 最终输出布局（最后一段）：有 deparser ⇒ emit 序；否则 ⇒ PHV 全量 ----
+    val emitLayoutSlots: Option[Seq[Slot]] = prog.deparser.map { d =>
+      val stt = slotTablesOf(prog, parserOpt, ctrlOpt)
+      val seen = scala.collection.mutable.LinkedHashSet.empty[Slot]
+      d.emits.foreach { e =>
+        val inst = e.path.last
+        val hi = stt.insts.find(_.inst == inst).getOrElse(throw new P4Error(
+          s"行 ${e.line}：deparser emit 引用了未知的 header 实例 '$inst'"))
+        seen += stt.validSlotOf(hi.inst)
+        hi.ht.fields.foreach(f => seen += stt.fieldSlotOf(Seq(hi.inst, f.name)))
+      }
+      seen.toSeq
+    }
+    val finalOutChan = if (prog.deparser.isDefined) "pkt_out" else "phv_out"
+
+    // ---- 段的 IO ----
+    // 输入：parser 段 = pkt_in（报文窗口）；无 parser 的首段 = phv_in（外部直接给 PHV）；
+    //       其余段 = proc 间通道 ph_<i-1>。
+    // 输出：最后一段 = finalOutChan；中间段 = ph_<i>（ready_valid + FIFO）。
+    val ios: Seq[SegIo] = segs.zipWithIndex.map { case (seg, i) =>
+      val in: (String, Int) = (seg, i) match {
+        case (ParserSeg(_), _) => ("pkt_in", PktWindowBits)
+        case (_, 0)            => ("phv_in", phvWidth)      // 无 parser 的首段
+        case (_, k)            => (s"ph_${k - 1}", phvWidth)
+      }
+      val isLast = i == segs.length - 1
+      val out: (String, Option[Seq[Slot]]) =
+        if (isLast) (finalOutChan, emitLayoutSlots) else (s"ph_$i", None)
+      SegIo(in._1, in._2, out._1, out._2)
+    }
+
+    // ---- 发射各段 ----
+    val segTexts: Seq[String] = segs.zip(segNames).zip(ios).map {
+      case ((seg, name), io) =>
+        val isTop = segs.length == 1
+        emitSeg(seg, name, io, isTop, ctrlOpt, prog, pkg, ids)
+    }
+
+    if (segs.length == 1) {
+      b ++= segTexts.head
+      b ++= "\n"
+      b.toString
+    } else {
+      // ---- Top 壳：外部通道借给子段 + proc 间 FIFO 通道 + proc_instantiation ----
+      // proc 间通道（ph_*）= ready_valid + fifo_depth=FIFO_DEPTH 的 package 级 chan，
+      // codegen 自动实例化 xls_fifo_wrapper —— 查找结果与包头/Meta 在 FIFO 里对齐后
+      // 进入下一段的 action 处理；慢表 stall 只影响 FIFO 占用，不丢包。
+      val top = new Builder(pkg, topName, ids, top = true, noState = true)
+      val instChans: Seq[Seq[String]] = segs.zip(ios).zipWithIndex.map {
+        case ((seg, io), i) =>
+          val chans = segChans(seg, io, ctrlOpt, prog, phvWidth)
+          // 1) 外部通道在 Top 签名上同名同方向声明（proc_instantiation 绑定需要）
+          chans.foreach { c =>
+            if (!c.name.startsWith("ph_"))
+              top.declareChan(c.name, c.direction, c.width, c.flowControl)
+          }
+          // 2) 中间通道（本段 send 出去的 ph_i）在 Top 上 loopback
+          if (io.outChan.startsWith("ph_"))
+            top.declareLoopbackChan(io.outChan, phvWidth, "ready_valid", FifoDepth)
+          // 3) 本段的绑定顺序 = 子段 interface 顺序
+          chans.map(_.name)
+      }
+      segs.zip(segNames).zip(instChans).foreach { case ((_, name), chans) =>
+        top.instantiateProc(s"i_$name", name, chans)
+      }
+      // ⚠️ 顺序：子 proc 必须先于 Top（ParseProcInstantiation 用 TryGetProc 解析
+      // proc= 引用，被实例化者须已 parse —— 先定义后引用）
+      b ++= segTexts.mkString("\n")
+      b ++= "\n"
+      b ++= top.render
+      b ++= "\n"
+      b.toString
+    }
   }
 }

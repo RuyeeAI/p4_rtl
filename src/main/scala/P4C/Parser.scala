@@ -498,7 +498,8 @@ class Parser(toks0: Seq[Tok], scan: Directive.ScanResult = Directive.ScanResult.
     }
     eat("}")
     TableDecl(name, keys.toSeq, actions.toSeq, entries.toSeq, ln,
-      isRuntime = rt.isDefined, runtimeSize = rt.map(_.size).getOrElse(0))
+      isRuntime = rt.isDefined, runtimeSize = rt.map(_.size).getOrElse(0),
+      latencyMin = rt.flatMap(_.latencyMin), latencyMax = rt.flatMap(_.latencyMax))
   }
 
   private def parseTableEntry(): TableEntry = {

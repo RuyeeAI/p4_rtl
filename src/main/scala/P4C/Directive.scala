@@ -30,8 +30,14 @@ import scala.collection.mutable
   */
 object Directive {
 
-  /** 运行时表指示的载荷：表名 + 表深（size）。 */
-  final case class TableDirective(name: String, size: Int)
+  /** 运行时表指示的载荷：表名 + 表深（size）+ 查找延时范围（latency，可选）。
+    *
+    * latency = `latency=<min>-<max>`（拍）：外部表模块对一次查找的响应延时范围。
+    * 生成侧用途：① 写进 IR 的表通道注释（对外部表模块的接口契约）；
+    * ② 报告输出；③ 校验 min ≥ 1（组合表不存在）。查找 FSM 是「一包在途」——
+    * 阻塞等 rsp，任意落在 [min, max] 的延时都正确，慢表只降吞吐不丢包。 */
+  final case class TableDirective(name: String, size: Int,
+                                  latencyMin: Option[Int] = None, latencyMax: Option[Int] = None)
 
   /** 并行查找组指示的载荷：组名 + 成员表名（有序，声明序即组内 key 位序语义的参考）。 */
   final case class GroupDirective(name: String, tables: Seq[String])
@@ -67,8 +73,9 @@ object Directive {
   private val triggerRe = "(?i)^\\s*//\\s*p4c\\s*:".r
   // 取值行：stages = N（N 为非负整数；正负号不匹配 → 报"无法解析"）。
   private val valueRe = "(?i)^\\s*//\\s*p4c\\s*:\\s*stages\\s*=\\s*(\\d+)(?:\\s.*)?$".r
-  // 运行时表行：table <表名> runtime [size=N]（表名是紧邻性的冗余校验；size 缺省 DefaultTableSize）。
-  private val tableRe = "(?i)^\\s*//\\s*p4c\\s*:\\s*table\\s+([A-Za-z_]\\w*)\\s+runtime(?:\\s+size\\s*=\\s*(\\d+))?(?:\\s.*)?$".r
+  // 运行时表行：table <表名> runtime [size=N] [latency=<min>-<max>]
+  // （表名是紧邻性的冗余校验；size 缺省 DefaultTableSize；latency 为外部表延时范围）。
+  private val tableRe = "(?i)^\\s*//\\s*p4c\\s*:\\s*table\\s+([A-Za-z_]\\w*)\\s+runtime(?:\\s+size\\s*=\\s*(\\d+))?(?:\\s+latency\\s*=\\s*(\\d+)\\s*-\\s*(\\d+))?(?:\\s.*)?$".r
   // 并行查找组行（顶层作用域）：lookup-group <组名> = <表1>, <表2>[, ...]
   private val groupRe = "(?i)^\\s*//\\s*p4c\\s*:\\s*lookup-group\\s+([A-Za-z_]\\w*)\\s*=\\s*(.+?)\\s*$".r
 
@@ -106,7 +113,19 @@ object Directive {
               val size = Option(t.group(2)).map(_.toInt).getOrElse(DefaultTableSize)
               if (size < 1)
                 throw new P4Error(s"行 $lineNo：p4c: table $tname runtime 的 size 必须 ≥ 1（got $size）")
-              tmap(lineNo) = TableDirective(tname, size)
+              val latMin = Option(t.group(3)).map(_.toInt)
+              val latMax = Option(t.group(4)).map(_.toInt)
+              (latMin, latMax) match {
+                case (None, None) => () // 未配置 latency：合法
+                case (Some(mn), Some(mx)) =>
+                  if (mn < 1)
+                    throw new P4Error(s"行 $lineNo：table $tname 的 latency min 必须 ≥ 1（组合表不存在；got $mn）")
+                  if (mn > mx)
+                    throw new P4Error(s"行 $lineNo：table $tname 的 latency 范围非法（min $mn > max $mx）")
+                case _ =>
+                  throw new P4Error(s"行 $lineNo：table $tname 的 latency= 需要 <min>-<max> 成对给出")
+              }
+              tmap(lineNo) = TableDirective(tname, size, latMin, latMax)
             case None => groupRe.findFirstMatchIn(ln) match {
               case Some(g) =>
                 val gname = g.group(1)
