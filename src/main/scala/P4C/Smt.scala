@@ -77,7 +77,10 @@ object Smt {
     case Ir.InputRef(path, w) => c.inputs((path, w))
     case Ir.Zext(s, w) =>
       val sw = c.dag.nodes(s).width
-      s"((_ zero_extend ${w - sw}) ${exprOf(c, s)})"
+      val e  = exprOf(c, s)
+      // 同宽零扩是恒等 —— 若照发 `((_ zero_extend 0) x)`，z3 会报
+      // "invalid zero_extend application" 而整条等价性证明变成 Unknown（实测踩过）
+      if (w <= sw) e else s"((_ zero_extend ${w - sw}) $e)"
     case Ir.Trunc(s, w) => s"((_ extract ${w - 1} 0) ${exprOf(c, s)})"
     case Ir.Slice(s, hi, lo) => s"((_ extract $hi $lo) ${exprOf(c, s)})"
     case Ir.Cat(parts, _) => s"(concat ${parts.map(p => exprOf(c, p)).mkString(" ")})"
@@ -86,11 +89,21 @@ object Smt {
     case Ir.Mux(cond, t, f, _) =>
       s"(ite (= ((_ extract 0 0) ${exprOf(c, cond)}) (_ bv1 1)) ${exprOf(c, t)} ${exprOf(c, f)})"
     case Ir.Bin(op, l, r, w) =>
-      val le = exprOf(c, l)
-      val re = exprOf(c, r)
-      val rw = c.dag.nodes(r).width
-      // 移位量与操作数同宽（bvshl/bvlshr 要求同 sort；窄移位量零扩——值语义不变）
-      val rex = if (rw == w) re else s"((_ zero_extend ${w - rw}) $re)"
+      // 两个操作数都要对齐到节点宽度 w：窄的零扩、宽的截断。
+      // ⚠️ 两个坑都踩过：
+      //   ① 只对右操作数做处理，左操作数宽度不匹配时会 sort mismatch；
+      //   ② 把"比节点宽"的右操作数当成"窄"处理 ⇒ `w - rw` 为负
+      //      ⇒ 生成 `((_ zero_extend -1) x)`，z3 直接报 invalid zero_extend application，
+      //      整条等价性证明退化成 Unknown（不是"不等价"）。
+      def atWidth(id: Ir.NodeId): String = {
+        val ww = c.dag.nodes(id).width
+        val e  = exprOf(c, id)
+        if (ww == w) e
+        else if (ww < w) s"((_ zero_extend ${w - ww}) $e)"
+        else s"((_ extract ${w - 1} 0) $e)"
+      }
+      val le  = atWidth(l)
+      val rex = atWidth(r)
       op match {
         case Ir.Add => s"(bvadd $le $rex)"
         case Ir.Sub => s"(bvsub $le $rex)"

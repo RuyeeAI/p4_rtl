@@ -286,10 +286,26 @@ object IrText {
       args.split(",").map(_.trim).filter(_.startsWith(s"$key=")).map(_.stripPrefix(s"$key=").trim.toInt)
         .headOption.getOrElse(throw new P4Error(s"IrText.parse：缺少命名参数 $key"))
 
+    /** 任意宽度常量（literal 的 value）。
+      *
+      * ⚠️ 不能用 [[intArg]]：它的 `toInt` 在 32 位以上常量上必然溢出。
+      * 48 位 MAC（例 0x00deadbeef01 = 956397711105）就会抛
+      * `NumberFormatException: For input string: "956397711105"` —— 而 MAC 常量
+      * 恰恰是最常见的大常量。这里按 BigInt 解析，支持十进制与 0x/0b 前缀。 */
+    def bigArg(args: String, key: String): BigInt =
+      args.split(",").map(_.trim).filter(_.startsWith(s"$key="))
+        .map(_.stripPrefix(s"$key=").trim).headOption
+        .map {
+          case s if s.startsWith("0x") || s.startsWith("0X") => BigInt(s.drop(2), 16)
+          case s if s.startsWith("0b") || s.startsWith("0B") => BigInt(s.drop(2), 2)
+          case s => BigInt(s)
+        }
+        .getOrElse(throw new P4Error(s"IrText.parse：缺少命名参数 $key"))
+
     nodeDecls.foreach { case (nm, ty, op, args) =>
       val pos = args.split(",").map(_.trim).filterNot(_.contains('=')).filter(_.nonEmpty).toSeq
       val node: Ir.Node = op match {
-        case "literal" => Ir.Const(BigInt(intArg(args, "value")), wOf(ty))
+        case "literal" => Ir.Const(bigArg(args, "value"), wOf(ty))
         case "zero_ext" => Ir.Zext(refOf(pos(0)), intArg(args, "new_bit_count"))
         case "bit_slice" =>
           val st = intArg(args, "start"); val wd = intArg(args, "width")

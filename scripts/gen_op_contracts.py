@@ -153,19 +153,48 @@ def main() -> int:
     # 因此大量二元/一元 op（add/sub/and/or/xor/not/eq/lt/shll...）没有显式
     # case。它们的 op 名全集来自 xls/ir/op_list.h。这些 op 的 arity 不做静态
     # 校验（arity=None），仅确认 op 名合法。
+    #
+    # ⚠️ op_list.h 同时是 **IR 文本 op 名** 的权威来源：`to_snake(C++ 名)` 未必
+    # 等于 IR 名（例：kNext 的 IR 名是 `next_value` 而不是 `next`）。早期版本只按
+    # snake 名收录 case 契约，导致这类 op 的契约挂错键、被这里当成"无 case"补成空
+    # 契约 —— 表现为 lint 对合法 IR 报一堆 E_UNKNOWN_KW。故这里先做名字重映射。
     op_list = parser_cc.parent / "op_list.h"
     n_default = 0
+    n_renamed = 0
     if op_list.exists():
         lst = op_list.read_text(encoding="utf-8", errors="replace")
         for cxx, enum, name in re.findall(
             r'F\((k[A-Za-z0-9]+),\s*(OP_[A-Z0-9_]+),\s*"([a-z0-9_]+)"', lst
         ):
+            snake = to_snake(cxx[1:])   # 注意剥掉枚举名的 'k' 前缀：kNext -> next
+            if snake == name:
+                if name in contracts:
+                    continue
+                # 名字一致但没扫到 case（default 分支）→ 空契约
+                contracts[name] = {
+                    "op": cxx[1:],
+                    "positional": POSITIONAL_NAMES.get(cxx, []),
+                    "arity": None,
+                    "mandatory_keywords": [],
+                    "optional_keywords": [],
+                    "source": "op_list.h/default(BinaryOrUnary)",
+                }
+                n_default += 1
+                continue
+            if snake in contracts:
+                # 已有 case 契约但键名是 C++ 名 → 改挂到 IR 名
+                c = contracts.pop(snake)
+                c["op"] = cxx[1:]
+                c["source"] = "ir_parser.cc/case + op_list.h/IR 名重映射"
+                contracts[name] = c
+                n_renamed += 1
+                continue
             if name in contracts:
                 continue
             contracts[name] = {
                 "op": cxx[1:],
                 "positional": POSITIONAL_NAMES.get(cxx, []),
-                "arity": None,  # default 分支，不做 arity 静态校验
+                "arity": None,
                 "mandatory_keywords": [],
                 "optional_keywords": [],
                 "source": "op_list.h/default(BinaryOrUnary)",
@@ -187,8 +216,10 @@ def main() -> int:
     print(f"✅ 提取 {len(contracts)} 条 op 契约 -> {args.out}")
     print(f"   显式 case（含参数契约）: {len(contracts) - n_default} 条")
     print(f"   来自 op_list.h（arity 不校验）: {n_default} 条")
+    print(f"   按 op_list.h 的 IR 名重映射键名: {n_renamed} 条")
     print(f"   其中 {n_kw} 条含必选关键字参数")
-    for name in ("array_index", "sel", "zero_ext", "bit_slice", "literal", "concat"):
+    for name in ("array_index", "sel", "zero_ext", "bit_slice", "literal", "concat",
+                 "next_value", "state_read"):
         if name in contracts:
             c = contracts[name]
             print(

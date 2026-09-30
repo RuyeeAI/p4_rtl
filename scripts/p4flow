@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# p4flow —— P4 源码 → （仿真模型 | Verilog | Chisel BlackBox | 形式验证 | 资源报告）一站式入口
+#
+# 设计：**优先用打包好的 fat jar**（cli/target/scala-2.13/p4xls.jar）——
+# 它是自包含的：Scala 侧 + 内嵌的 Python 工具（xls_ir_lint.py / gen_chisel_wrapper.py）
+# 都在 jar 里，不依赖仓库 scripts/ 目录是否存在。
+# 没有 jar 时回退到 classes 目录（开发态，改完 sbt compile 即可用，省去打包）。
+#
+# 外部依赖（流程会显式探测，缺哪步就 SKIP 哪步并在报告里标注）：
+#   - XLS harness 二进制：third_party/xls/bazel-bin/p4xls_harness/{ir_check_main,verilog_codegen_main}
+#     可用 P4XLS_HARNESS_DIR 覆盖；构建：scripts/bootstrap_xls_env.sh
+#   - python3 / iverilog / vvp / z3
+#
+# 用法：
+#   scripts/p4flow <in.p4> [-o <outDir>] [--top=NAME] [--stages=N]
+#                  [--only=a,b] [--skip=a,b] [--no-sim]
+#   scripts/p4flow -h
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+JAR="$ROOT/cli/target/scala-2.13/p4xls.jar"
+
+export P4XLS_ROOT="${P4XLS_ROOT:-$ROOT}"
+
+if [ -f "${JAR}" ]; then
+  exec java -jar "${JAR}" flow "$@"
+fi
+
+# 回退：classes 目录（需先 sbt compile）
+exec "${ROOT}/scripts/p4xls" flow "$@"

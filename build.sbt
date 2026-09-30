@@ -59,3 +59,40 @@ lazy val cli = (project in file("cli"))
         old(x)
     },
   )
+
+// ---------------------------------------------------------------------------
+// 外部表模块：参数化 EM（后续 LPM / TCAM）行为模型。
+//
+// 独立子工程（有自己的 scalaVersion 与 chisel 依赖），**不参与 root 的编译**，
+// 因此 root 依然保持"纯 Scala、不打进 chisel3"的定位（fat jar 不受影响）。
+//
+// chisel 版本与 ../HardwareDesign 对齐（chisel 5.3.0 / scala 2.13.12），
+// 因为 EM 的存储直接复用 HardwareDesign BaseCbb 的 Memory 体系
+//（HT/KT 用 TpMemoryWrap3，AD 用 SpMemoryWrap3）—— 源码级依赖，不拷贝文件。
+// ---------------------------------------------------------------------------
+lazy val hwRepo = sys.env.getOrElse(
+  "HARDWARE_DESIGN_REPO",
+  "/Users/haoyu/Documents/01-Work/Code-Repos/HardwareDesign"
+)
+
+lazy val em = (project in file("em"))
+  .settings(
+    name := "p4xls-em",
+    scalaVersion := "2.13.12",
+    libraryDependencies ++= Seq(
+      "org.chipsalliance" %% "chisel" % "5.3.0",
+    ),
+    addCompilerPlugin("org.chipsalliance" % "chisel-plugin" % "5.3.0" cross CrossVersion.full),
+    Compile / unmanagedSources ++= Seq(
+      file(hwRepo) / "src/main/scala/BaseCbb/data/GenBundle.scala",
+      file(hwRepo) / "src/main/scala/BaseCbb/memory/Memory.scala",
+      file(hwRepo) / "src/main/scala/BaseCbb/memory/MemInitCpuAccess.scala",
+    ),
+    scalacOptions ++= Seq(
+      "-language:reflectiveCalls",
+      "-deprecation",
+      "-feature",
+      "-Xcheckinit",
+      "-Ymacro-annotations",
+    ),
+  )

@@ -14,6 +14,9 @@ import java.nio.file.{Files, Paths}
   *   wrap-chisel      把 XLS 生成的 Verilog 封装成 Chisel BlackBox + Shell
   *                    （路线 3：产物原样集成进下游 Chisel 工程）
   *   lint-ir <files>  XLS IR 文本静态校验（委托 scripts/xls_ir_lint.py）
+  *   eval-ir <fn.ir>  对单个 IR 函数抽象求值（IR 级行为验证，见 p4xls.EvalIr）
+  *   flow <in.p4>     一站式：P4 → （仿真模型 | Verilog | Chisel BlackBox |
+  *                    形式验证 | 资源报告），步骤与外部依赖见 p4xls.Flow
   *   version          版本信息
   *
   * 用法：
@@ -32,6 +35,8 @@ object Main {
     case "xls" :: rest     => runXls(rest.toArray)
     case "wrap-chisel" :: rest => runWrappedPy("wrap-chisel", "scripts/gen_chisel_wrapper.py", rest.toArray)
     case "lint-ir" :: rest => runWrappedPy("lint-ir", "scripts/xls_ir_lint.py", rest.toArray)
+    case "eval-ir" :: rest => EvalIr.run(rest.toArray)
+    case "flow" :: rest    => Flow.run(rest.toArray)
     case "version" :: _    => println(s"p4xls $Version  (P4 -> XLS IR -> RTL)"); 0
     case Nil | "-h" :: _ | "--help" :: _ | "help" :: _ => usage(); 0
     case other :: _ =>
@@ -76,18 +81,34 @@ object Main {
   }
 
   /** 委托给 Python 脚本的子命令（lint-ir / wrap-chisel 同模式）。 */
+  /** 跑仓库里的 Python 工具（scripts/ 优先，其次从 jar 资源解出来 —— 发布态单文件自包含）。
+    *
+    * 注意：不能用"当前目录下 scripts/ 存在与否"判断，jar 拷到别处跑时 cwd 里没有 scripts/，
+    * 必须回退到内嵌资源，否则 `p4xls lint-ir` 在发布形态下不可用（flow 走的是同一套逻辑）。
+    */
   private def runWrappedPy(name: String, scriptPath: String, args: Array[String]): Int = {
     if (name == "lint-ir" && args.isEmpty) {
       System.err.println("lint-ir 需要至少一个 .ir 文件或目录参数")
       return 2
     }
-    val script = new java.io.File(scriptPath)
-    if (!script.exists()) {
-      System.err.println(s"未找到 ${script.getPath}（请在工程根目录运行）")
-      return 2
+    val py   = sys.env.getOrElse("P4XLS_PYTHON", "python3")
+    val root = Flow.findRepoRoot()
+    val file = Paths.get(scriptPath).getFileName.toString
+
+    val extra =
+      if (name == "lint-ir")
+        Flow.contractsPath(root).map(p => Seq("--contracts", p.toString)).getOrElse(Seq.empty)
+      else Seq.empty
+
+    Flow.pyScript(file, root) match {
+      case None =>
+        System.err.println(s"未找到 $scriptPath（仓库 scripts/ 与 jar 内嵌资源都没有）")
+        2
+      case Some((cmd0, cleanup)) =>
+        val rc = scala.sys.process.Process(Seq(py) ++ cmd0 ++ extra ++ args.toSeq).!
+        cleanup()
+        rc
     }
-    val py = sys.env.getOrElse("P4XLS_PYTHON", "python3")
-    scala.sys.process.Process(Seq(py, script.getPath) ++ args).!
   }
 
   private def usage(): Unit = {
@@ -105,6 +126,11 @@ object Main {
          |                    把 XLS 生成的 Verilog 封装成 Chisel BlackBox + Shell
          |                    （产物集成进下游 Chisel 工程；用法见脚本头注释）
          |  lint-ir <files>   XLS IR 文本静态校验
+         |  eval-ir <fn.ir>   对单个 IR 函数抽象求值（IR 级行为验证）
+         |                    p4xls eval-ir -h 看路径口径与示例
+         |  flow <in.p4>      一站式流水线：P4 → IR → 校验/形式验证 → Verilog
+         |                    → Chisel BlackBox → 仿真模型 → 资源报告
+         |                    （p4flow <in.p4> -h 看步骤与外部依赖）
          |  version           版本
          |
          |示例:
@@ -112,6 +138,7 @@ object Main {
          |  p4xls xls testcases/p4/demo9-l3forwarder.p4 out/a2/demo9.ir
          |  p4xls wrap-chisel -o out/a2/chisel out/a2/*.v
          |  p4xls lint-ir out/ir
+         |  p4xls flow testcases/p4/demo9-l3forwarder.p4 -o out/flow/demo9
          |""".stripMargin
     )
   }
