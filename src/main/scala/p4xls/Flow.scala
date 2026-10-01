@@ -139,7 +139,15 @@ object Flow {
     val p = pb.start()
     val out = new StringBuilder
     val reader = new Thread(() => {
-      scala.io.Source.fromInputStream(p.getInputStream)("UTF-8").getLines().foreach { l => out.synchronized(out ++= l + "\n") }
+      // ⚠️ 必须按**字节**读并宽容解码：verilator 的 `%0s` 打印中文会产出非法
+      // UTF-8 字节，直接 Source("UTF-8") 解码会抛异常 ⇒ 整个日志丢失（表现为
+      // "用例 ok=0 fail=0" 的假成功）。这里把非法序列替换成 '?'，日志不丢。
+      val dec = java.nio.charset.Charset.forName("UTF-8").newDecoder()
+        .onMalformedInput(java.nio.charset.CodingErrorAction.REPLACE)
+        .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPLACE)
+      scala.io.Source.fromInputStream(p.getInputStream)(dec).getLines().foreach { l =>
+        out.synchronized(out ++= l + "\n")
+      }
     })
     reader.setDaemon(true); reader.start()
     val done = p.waitFor(timeoutSec.toLong, java.util.concurrent.TimeUnit.SECONDS)

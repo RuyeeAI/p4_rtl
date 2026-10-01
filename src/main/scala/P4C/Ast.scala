@@ -129,5 +129,14 @@ object Ast {
     parsers: Seq[ParserDecl],
     deparser: Option[DeparserDecl] = None,
     lookupGroups: Seq[LookupGroup] = Seq.empty,
+    /** 报文窗口宽度（位）：parser 能看到的报文位宽，顶层指示 `// p4c: pkt-window N`
+      * 覆盖（缺省 [[DefaultPktWindowBits]]）。可选封装（多层 VLAN / OpaqueTag）按
+      * **固定槽位**解析，窗口必须覆盖最坏情况（所有槽位都占满）的字节数。 */
+    pktWindowBits: Int = P4Program.DefaultPktWindowBits,
   )
+
+  object P4Program {
+    /** 缺省报文窗口宽度（位）—— 与 Chisel 线 `io.in = Input(UInt(512.W))` 一致。 */
+    val DefaultPktWindowBits: Int = 512
+  }
 }

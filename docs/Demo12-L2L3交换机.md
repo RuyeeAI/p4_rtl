@@ -1,4 +1,8 @@
-# demo12 —— 二层/三层混合交换机（v2：并行查找 + 报文编辑 + 报文重组）
+# demo12 —— 二层/三层混合交换机（v4：可选 OpaqueTag/VLAN + 并行查找 + 报文编辑 + 报文重组）
+
+> **v4 变更**（2026-10-02）：报文格式支持**可选封装** —— 1 层 OpaqueTag + 最多 4 层 VLAN，
+> 并在 ingress 里真正用起来（内层 VID 参与二层查表、上联口打标签、用户口剥标签）。
+> 见 §0。
 
 > 源文件：`testcases/p4/demo12-l2l3-switch.p4`（约 330 行）
 > 一键跑通：`scripts/p4flow testcases/p4/demo12-l2l3-switch.p4 -o out/flow/demo12`
@@ -8,6 +12,31 @@
 > ② 两张查找表外置为 key/rsp 通道；③ `// p4c: lookup-group` 并行查找分组。
 
 ---
+
+## 0. 可选封装：固定槽位方案（v4）
+
+子集**不支持** header stack / setValid / 变长 extract（看 `docs/进度与计划.md` 的语法子集表），
+所以「可选存在」按**固定槽位**实现：
+
+```
+Ethernet | [OpaqueTag] | [VLAN×0..4] | IPv4 | (UDP | TCP)
+  112    |     64      |   64 × n    | 160  |  64 or 160
+```
+
+- 每个可选层占一个**固定偏移**的槽位；不存在时槽位填 0；存在性由该槽位自身的
+  `tpid` 判定（`0x8100` = VLAN、`0x8200` = OpaqueTag）。
+- 每个可选槽位自带 `nextType`（下一层 ethertype）—— 这是固定偏移下判定「后面还有
+  没有 VLAN」以及「末端是不是 IPv4」的唯一手段。
+- 代价：① 不存在的层仍占带宽；② 入包缓冲必须**归一化到最坏布局**（缺的层补 0），
+  这也正是多数交换芯片内部报文总线的形态。
+- VLAN 增删 = **槽位内容搬移**（push：vlan3←vlan2←vlan1←vlan0←新；pop 反之）。
+  子集「同一 action 内读的是入口快照」的语义在这里正好是我们要的（整槽搬移）。
+
+**报文窗口**：`// p4c: pkt-window 800`（新指示，见 §6）—— 默认 512 位装不下最坏布局。
+
+**偏移口径（易踩）**：header **起点**按字节对齐（偏移 = 前面各 header 的
+`Σceil(字段宽/8)` 之和），但 header **内部**字段是位紧凑排列、不逐字段补齐。
+⇒ 组包时每个 header 内部按位拼，header 之间补到字节边界。
 
 ## 1. 交换机结构与处理流水
 
@@ -109,11 +138,11 @@ proc 在收 rsp 的相位**同拍**应用对应 action（stall 等 rsp，查找�
 
 | 端口 | 位宽 | 方向 | 内容 |
 |---|---|---|---|
-| `pkt_in` | 512 | in | 入包 |
-| `pkt_out` | 500 | out | **重组后的报文**（ethernet113+ipv4161+udp65+tcp161） |
+| `pkt_in` | **800**（`pkt-window`） | in | 入包（固定槽位最坏布局，见 §0） |
+| `pkt_out` | **825** | out | **重组后的报文**（eth113 + otag65 + vlan×4 65 + ipv4 161 + udp65 + tcp161） |
 | `ex_portBytes` | 256 | out | Register：8×32 每端口字节 |
 | `ex_fwdCnt` | 128 | out | Counter：4×32 每类计数（0=L2 1=L3 2=丢弃） |
-| `tbl_mac_table_key/rsp` | 48/6 | out/in | L2 查找 |
+| `tbl_mac_table_key/rsp` | **64**/6 | out/in | L2 查找（key = 目的 MAC 48 + **内层 VID** 16） |
 | `tbl_route_table_key/rsp` | 40/102 | out/in | L3 查找 |
 
 ## 7. 实测
@@ -121,12 +150,12 @@ proc 在收 rsp 的相位**同拍**应用对应 action（stall 等 rsp，查找�
 | 项 | 结果 |
 |---|---|
 | p4flow | 9 步 OK（含 verilator 仿真），II=1 |
-| **RTL 仿真（TB 激励）** | `testcases/a2/tb_demo12_l2l3_switch.v` **24 条断言全绿**（verilator + FST） |
+| **RTL 仿真（TB 激励）** | `testcases/a2/tb_demo12_l2l3_switch.v` **39 条断言全绿**（verilator + FST），5 类场景：L2+剥 VLAN / L3+打 VLAN / OpaqueTag+双层 VLAN / TTL 耗尽 / 泛洪 |
 | 真 XLS parser 校验 | IR 良构、往返一致 |
 | IR lint | 通过（0 issue） |
 | 形式验证 | 11 fn：**等价 22 · 不等价 0 · 未决 0** |
 | Verilog | 828 行 / 寄存器 54 个 1242 位 |
-| 行为断言 | `demo12_verify.py` **47/47 通过**（IR 级）+ TB **24/24**（RTL 级） |
+| 行为断言 | `demo12_verify.py` **52/52 通过**（IR 级）+ TB **39/39**（RTL 级） |
 
 并行查找证据（IR 文本）：
 

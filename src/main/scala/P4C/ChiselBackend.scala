@@ -1139,7 +1139,7 @@ object ChiselBackend {
     val out = mutable.ArrayBuffer.empty[String]
     val layouts = layoutParser(p, prog)
     val className = pascal(prefix) + pascal(p.name) + "Parser"
-    val windowBits = 512
+    val windowBits = prog.pktWindowBits
 
     // out 参数 bundle
     val outParams = p.params.filter(_.direction == "out")
@@ -1336,7 +1336,7 @@ object ChiselBackend {
     val parserCls = pascal(prefix) + pascal(p.name) + "Parser"
     val controlCls = pascal(prefix) + pascal(c.name)
     val topCls = pascal(prefix) + "Top"
-    val windowBits = 512
+    val windowBits = prog.pktWindowBits
 
     // control 的第一个 inout/in 参数接 parser 输出（类型需匹配），其余参数清零
     val hdrParam = c.params.find(_.direction == "inout").orElse(c.params.find(_.direction == "in"))

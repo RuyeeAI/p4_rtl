@@ -61,6 +61,8 @@ object Directive {
     /** 并行查找组指示：行号 → 载荷。**顶层作用域**（不参与紧邻性匹配与认领），
       * 由 Parser 组装进 `P4Program.lookupGroups`，依赖校验在后端。 */
     groupDirectives: Seq[(Int, GroupDirective)] = Seq.empty,
+    /** 报文窗口宽度指示（顶层）：行号 → 位数。**全局唯一**（重复声明报错）。 */
+    pktWindowDirectives: Seq[(Int, Int)] = Seq.empty,
   )
 
   object ScanResult {
@@ -78,6 +80,8 @@ object Directive {
   private val tableRe = "(?i)^\\s*//\\s*p4c\\s*:\\s*table\\s+([A-Za-z_]\\w*)\\s+runtime(?:\\s+size\\s*=\\s*(\\d+))?(?:\\s+latency\\s*=\\s*(\\d+)\\s*-\\s*(\\d+))?(?:\\s.*)?$".r
   // 并行查找组行（顶层作用域）：lookup-group <组名> = <表1>, <表2>[, ...]
   private val groupRe = "(?i)^\\s*//\\s*p4c\\s*:\\s*lookup-group\\s+([A-Za-z_]\\w*)\\s*=\\s*(.+?)\\s*$".r
+  // 报文窗口行（顶层作用域）：pkt-window <位数> —— parser 能看到的报文位宽。
+  private val pktWindowRe = "(?i)^\\s*//\\s*p4c\\s*:\\s*pkt-window\\s+(\\d+)(?:\\s.*)?$".r
 
   /** 扫描原始源码中的全部编译指示。
     *   - 触发段（`// p4c:`）落在块注释内的行 → 抑制（记入 suppressedInBlock）：
@@ -90,6 +94,7 @@ object Directive {
     val map = mutable.LinkedHashMap.empty[Int, Int]
     val tmap = mutable.LinkedHashMap.empty[Int, TableDirective]
     val gmap = mutable.LinkedHashMap.empty[Int, GroupDirective]
+    val wmap = mutable.ArrayBuffer.empty[(Int, Int)]
     val suppressed = mutable.ArrayBuffer.empty[(Int, String)]
     var off = 0 // 当前行首字符在 src/code 中的偏移（'\n' 占 1，与 split("\n") 对齐）
     lines.zipWithIndex.foreach { case (ln, i) =>
@@ -135,18 +140,27 @@ object Directive {
                 if (tabs.distinct.size != tabs.size)
                   throw new P4Error(s"行 $lineNo：lookup-group $gname 的成员表重复：${tabs.mkString(",")}")
                 gmap(lineNo) = GroupDirective(gname, tabs)
-              case None =>
-                throw new P4Error(
-                  s"行 $lineNo：无法解析的 p4c 编译指示（期望 '// p4c: stages=N'（N ≥ 1）、" +
-                    s"'// p4c: table <表名> runtime [size=N]' 或 " +
-                    s"'// p4c: lookup-group <组名> = <表1>, <表2>, ...'）：'${ln.trim}'")
+              case None => pktWindowRe.findFirstMatchIn(ln) match {
+                case Some(w) =>
+                  val n = w.group(1).toInt
+                  // 下界取一个以太网帧头（112 位）：再小没有意义，多半是指示写错
+                  if (n < 112)
+                    throw new P4Error(s"行 $lineNo：p4c: pkt-window 必须 ≥ 112（got $n）")
+                  wmap += ((lineNo, n))
+                case None =>
+                  throw new P4Error(
+                    s"行 $lineNo：无法解析的 p4c 编译指示（期望 '// p4c: stages=N'（N ≥ 1）、" +
+                      s"'// p4c: table <表名> runtime [size=N]'、" +
+                      s"'// p4c: lookup-group <组名> = <表1>, <表2>, ...' 或 " +
+                      s"'// p4c: pkt-window <位数>'）：'${ln.trim}'")
+              }
             }
           }
         }
       }
       off += ln.length + 1
     }
-    ScanResult(map.toMap, lines, suppressed.toSeq, tmap.toMap, gmap.toSeq)
+    ScanResult(map.toMap, lines, suppressed.toSeq, tmap.toMap, gmap.toSeq, wmap.toSeq)
   }
 
   /** 声明行 `declLine` 的生效切拍指示（[[tableFor]] 的同构运行时表版本共用

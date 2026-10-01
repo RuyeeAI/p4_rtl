@@ -94,8 +94,15 @@ class Parser(toks0: Seq[Tok], scan: Directive.ScanResult = Directive.ScanResult.
       }
     }
 
+    // ---- 报文窗口宽度（顶层指示，全局唯一）----
+    if (scan.pktWindowDirectives.size > 1)
+      throw new P4Error(s"行 ${scan.pktWindowDirectives(1)._1}：pkt-window 重复声明" +
+        s"（已有行 ${scan.pktWindowDirectives.head._1} 的 ${scan.pktWindowDirectives.head._2} 位）")
+    val pktWindowBits = scan.pktWindowDirectives.headOption.map(_._2)
+      .getOrElse(P4Program.DefaultPktWindowBits)
+
     P4Program(headerTypes.toSeq, structs.toSeq, controls.toSeq, parsers.toSeq,
-      deparser = deparser, lookupGroups = lookupGroups)
+      deparser = deparser, lookupGroups = lookupGroups, pktWindowBits = pktWindowBits)
   }
 
   /** 顶层 const 常量表（R5）：name → (值, 声明宽)。[[parsePrimary]] 处按名替换为带宽字面量。 */

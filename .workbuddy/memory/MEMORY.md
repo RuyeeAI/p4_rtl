@@ -194,6 +194,17 @@ XLS 线出 pkt_out 通道；Chisel 线告警跳过）、
 - ⚠️ p4x 的 bug：`sim` 以输出目录为 cwd 却传相对 bmv2 JSON → 打不开；
   golden_sim.sh 已把 `-o` 统一转绝对路径规避。
 
+## 报文窗口与偏移口径（2026-10-02 定）
+
+- **`// p4c: pkt-window N`**（顶层指示，全局唯一，≥112）：报文窗口此前写死 512 位；
+  多层可选封装（VLAN/OpaqueTag）需要放大。→ `P4Program.pktWindowBits`，Xls/Chisel 共用。
+- ⚠️ **偏移口径**：header **起点**字节对齐（偏移 = 前序 header 的 `Σceil(字段宽/8)`），
+  但 header **内部**字段**位紧凑**、不逐字段补齐 ⇒ 组包/TB 按错口径写会整体错位
+  （`pcp(3)/dei(1)` 各占 1 字节，VLAN 槽 stride 是 64 不是 48）。
+- **可选封装（无 header stack/setValid）** ⇒ **固定槽位 + 存在标志**：每层占固定偏移
+  槽位、自带 `tpid` + `nextType`；不存在填 0；增删 = 槽位内容搬移（正好用上
+  「同一 action 读入口快照」语义）。代价：入包需归一化到最坏布局。
+
 ## 下一步
 
 1. demo12 TB 补激励　2. 前端改动回灌 `../P4C`　3. EM 后续（LPM/TCAM）在 HardwareDesign 侧推进

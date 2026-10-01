@@ -51,8 +51,9 @@ import scala.collection.mutable
   */
 object XlsBackend {
 
-  /** 报文窗口宽度，与 Chisel 线一致（`io.in = Input(UInt(512.W))`）。 */
-  private val PktWindowBits = 512
+  /** 报文窗口宽度（位）：顶层指示 `// p4c: pkt-window N` 覆盖，缺省与 Chisel 线
+    * 一致（`io.in = Input(UInt(512.W))`）。在 [[emitProgram]] 入口按程序设置。 */
+  private var PktWindowBits: Int = P4Program.DefaultPktWindowBits
 
   /** proc 间 FIFO 通道的深度（用户需求：查找结果 / 包头 FIFO 对齐）。
     * codegen 为每条 loopback chan 实例化一个 `xls_fifo_wrapper(depth)`。 */
@@ -1026,6 +1027,8 @@ object XlsBackend {
     * @param sourceName 源文件名（写进注释）
     */
   def emitProgram(prog: P4Program, pkg: String, sourceName: String): String = {
+    // 报文窗口：可选封装（多层 VLAN / OpaqueTag）按固定槽位解析，窗口要覆盖最坏布局
+    PktWindowBits = prog.pktWindowBits
     // 全局 id：跨 fn/proc 唯一（A2-0 硬规则）
     val ids = new IdGen(1)
     val b = new StringBuilder
