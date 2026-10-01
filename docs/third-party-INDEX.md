@@ -1,7 +1,8 @@
 # 第三方源码索引
 
-`third_party/` 下的四个仓库**均为独立 git 仓库（非 submodule）**，合计约 **470 MB**，
-已在 `.gitignore` 中整体排除，不纳入本工程版本管理。
+四个仓库**均为独立 git 仓库（非 submodule）**，合计约 **470 MB**，放在
+**工程外同级目录 `../third_party/`**（2026-10-01 从工程内 `third_party/` 外迁：
+第三方源码 + 4 GB 级 bazel 输出基座留在工程内会让 IntelliJ 全量索引、卡到不可用）。
 本文档记录其来源与版本，供重建与追溯。
 
 | 目录 | 上游 | 基线 commit | 日期 | 体积 | 用途 |
@@ -22,7 +23,7 @@
 以 XLS 为例：
 
 ```bash
-mkdir -p third_party && cd third_party
+mkdir -p ../third_party && cd ../third_party
 git init -q -b main xls && cd xls
 git remote add origin https://github.com/google/xls.git
 git remote add mirror https://gh.monlor.com/https://github.com/google/xls.git

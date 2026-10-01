@@ -6,7 +6,7 @@
 ```bash
 scripts/p4flow testcases/p4/demo9-l3forwarder.p4 -o out/flow/demo9
 # 或直接用单文件 jar（不依赖仓库 scripts/ 与 config/）：
-P4XLS_HARNESS_DIR=<repo>/third_party/xls/bazel-bin/p4xls_harness \
+P4XLS_HARNESS_DIR=<repo>/../third_party/xls/bazel-bin/p4xls_harness \
   java -jar cli/target/scala-2.13/p4xls.jar flow <in.p4> -o <outDir>
 ```
 
@@ -27,7 +27,7 @@ P4XLS_HARNESS_DIR=<repo>/third_party/xls/bazel-bin/p4xls_harness \
 **必须外置的两样**（体积/许可原因，且流程会显式探测）：
 
 1. **XLS harness 二进制**：`ir_check_main`（36MB）、`verilog_codegen_main`
-   —— 用 `P4XLS_HARNESS_DIR` 指定，或按仓库相对路径 `third_party/xls/bazel-bin/p4xls_harness/`。
+   —— 用 `P4XLS_HARNESS_DIR` 指定，或按仓库相对路径 `../third_party/xls/bazel-bin/p4xls_harness/`。
    构建：`scripts/bootstrap_xls_env.sh`。
 2. **系统工具**：`python3` / `iverilog` / `vvp` / `z3`。
 
@@ -110,7 +110,7 @@ P4XLS_HARNESS_DIR=<repo>/third_party/xls/bazel-bin/p4xls_harness \
 
 ### 5.1 lint 的 proc / 数组 state 补全（2026-09-17）
 
-对齐对象是 `third_party/xls` 的真实源码，逐条标注出处：
+对齐对象是 `../third_party/xls` 的真实源码，逐条标注出处：
 
 | 补的能力 | 出处 |
 |---|---|

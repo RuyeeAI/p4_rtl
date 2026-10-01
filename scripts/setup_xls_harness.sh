@@ -5,6 +5,8 @@
 #   Bazel 的 label（如 //xls/ir:ir_parser）只在**同一个 workspace 内**可见。
 #   harness 的源文件保存在工程内（进版本控制），但 BUILD 必须出现在
 #   third_party/xls/ 之下才能引用那些 label。所以用本脚本做一次性注入。
+#   （third_party 在工程外同级目录：$ROOT/../third_party —— 2026-10-01 外迁，
+#   避免 IDE 索引第三方源码与 bazel 产物。）
 #
 #   选择「复制」而非「软链」：Bazel 对 workspace 内指向 workspace 之外的
 #   符号链接处理不一致（部分版本会报 symlink cycle 或直接忽略），复制虽
@@ -17,13 +19,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/xls_harness"
-DST="$ROOT/third_party/xls/p4xls_harness"
+DST="$ROOT/../third_party/xls/p4xls_harness"
 
 check_only=false
 [ "${1:-}" = "--check" ] && check_only=true
 
-if [ ! -d "$ROOT/third_party/xls" ]; then
-  echo "❌ XLS 源码树不存在: $ROOT/third_party/xls" >&2
+if [ ! -d "$ROOT/../third_party/xls" ]; then
+  echo "❌ XLS 源码树不存在: $ROOT/../third_party/xls" >&2
   echo "   先拉取：见 docs/third-party-INDEX.md" >&2
   exit 1
 fi
@@ -62,10 +64,7 @@ if [ "${#changed[@]}" -gt 0 ]; then
   find "$DST" -name '.DS_Store' -delete 2>/dev/null || true
 fi
 
-# 注入目录整体不进主仓库（third_party/ 已在 .gitignore 中，这里做双保险）
-if ! grep -qx "third_party/xls/p4xls_harness/" "$ROOT/.gitignore" 2>/dev/null; then
-  printf 'third_party/xls/p4xls_harness/\n' >> "$ROOT/.gitignore"
-fi
+# 注入目录在工程外（$ROOT/../third_party/），天然不进主仓库，无需 gitignore。
 
 if [ "${#changed[@]}" -eq 0 ]; then
   echo "✅ harness 已是最新（$(ls -1 "$DST" | wc -l | tr -d ' ') 个文件）"

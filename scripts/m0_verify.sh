@@ -22,7 +22,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/third_party/xls/bazel-bin/p4xls_harness/verilog_codegen_main"
+BIN="$ROOT/../third_party/xls/bazel-bin/p4xls_harness/verilog_codegen_main"
 IR="$ROOT/testcases/m0/m0_key_rsp_loop.ir"
 TB="$ROOT/testcases/m0/tb_m0_key_rsp_loop.v"
 OUT="$ROOT/out/m0"

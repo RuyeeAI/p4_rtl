@@ -27,8 +27,8 @@ generated/
 
 # ---- 第三方源码（合计约 470MB，各自是独立 git 仓库，非 submodule）----
 # 拉取方式见 docs/third-party-INDEX.md
-third_party/
-third_party/xls/p4xls_harness/
+# third_party 与 .tools 已外迁至工程外同级目录 ../third_party/（2026-10-01）
+
 
 # ---- Python 缓存 ----
 __pycache__/

@@ -73,7 +73,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-XLS="$ROOT/third_party/xls"
+XLS="$ROOT/../third_party/xls"
 MOD_SRC="$ROOT/config/xls_MODULE.bazel.minimal"
 MOD_TARGET="$XLS/MODULE.bazel"
 MOD_BACKUP="$XLS/MODULE.bazel.orig"

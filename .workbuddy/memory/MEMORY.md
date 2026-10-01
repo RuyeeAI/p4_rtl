@@ -10,7 +10,9 @@
 
 ## 工程结构
 
-- 根目录 `/Users/haoyu/Documents/01-Work/Code-Repos/p4_rtl`；`docs/` 文档、`third_party/` 依赖、
+- 根目录 `/Users/haoyu/Documents/01-Work/Code-Repos/p4_rtl`；`docs/` 文档、
+  **第三方依赖在工程外同级 `../third_party/`（xls/p4c/behavioral-model/p4-spec，
+  含 `.tools` bazel 基座；2026-10-01 外迁避免 IDE 索引）**、
   `scripts/` 脚本、`testcases/` 样本（p4/ir/tb）、`out/` 产物、`.workbuddy/memory/` 日志。
 - sbt + Scala；`src/main/scala/P4C/` fork 自 `../P4C`（**包名保持 `P4C`** 便于 diff；
   fork 基线 = `../P4C` 的 `8c7eaaf`，此后改动**尚未回流**）。
@@ -145,7 +147,7 @@ XLS 线出 pkt_out 通道；Chisel 线告警跳过）、
 - ✅ **`lint` 已是真门禁**（2026-09-17 补齐 proc/数组 state 后，报错即 FAIL，不再降级 WARN）。
   `p4xls lint-ir` 也走同一套"仓库 scripts/ → jar 内嵌"回退，单 jar + 空 root 可用。
 - 改 lint 后**必跑** `python3 scripts/xls_ir_lint_selftest.py`（42 例反向自测）；
-  正样本回归口径：官方全树 `third_party/xls/xls` 下 768 个 `.ir` 必须 **768/768**。
+  正样本回归口径：官方全树 `../third_party/xls/xls` 下 768 个 `.ir` 必须 **768/768**。
 - 详见 `docs/流程整合-p4flow.md`（§5.1 补的能力↔源码出处对照表）。
 
 ## 工具链坑（Chisel5 → firtool → iverilog，2026-09-16）

@@ -10,7 +10,7 @@ XLS 的 IR parser 对每个 op 用 ArgParser 声明参数：
 供 scripts/xls_ir_lint.py 做静态语法校验。
 
 用法:
-  python3 scripts/gen_op_contracts.py [--xls-dir third_party/xls] [-o config/op_contracts.json]
+  python3 scripts/gen_op_contracts.py [--xls-dir ../third_party/xls] [-o config/op_contracts.json]
 """
 
 from __future__ import annotations
@@ -126,7 +126,7 @@ def to_snake(op: str) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--xls-dir", default="third_party/xls", help="XLS 源码根目录")
+    ap.add_argument("--xls-dir", default="../third_party/xls", help="XLS 源码根目录")
     ap.add_argument("-o", "--out", default="config/op_contracts.json")
     args = ap.parse_args()
 

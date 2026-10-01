@@ -22,15 +22,18 @@ Chisel 版本口径：**chisel 7.15.0 / scala 2.13.16，与 ../HardwareDesign �
   - 激励是骨架（只复位+空转），功能激励在 main 的 TODO 处补 `poke/peek`。
 
 用法：
-  scripts/gen_chisel_wrapper.py -o out/a2/chisel out/a2/demo9-l3forwarder.v [...]
+  scripts/gen_chisel_wrapper.py -o out/flow/<样本>/chisel out/flow/<样本>/verilog/*.v
+    # 输入 = p4flow 拆分后的「一 module 一文件」产物，每个 .v 生成一个 .scala
+    #（BlackBox + Shell，文件名/类名都从 module 名派生）。
   scripts/gen_chisel_wrapper.py -o rtl/src/main/scala/p4xlsrtl --with-sim \\
-      --sim-extra <xls_fifo_wrapper.sv> --top Ingress_pipeline <demo12.v>
+      --top Ingress_pipeline --sim-stem demo12-l2l3-switch \\
+      --sim-extra <xls_fifo_wrapper.sv> out/flow/<样本>/verilog/*.v
 
 自检（生成后自动执行）：BB 的 io 字段数 == Verilog 端口数；Shell 连线语句数
 == 端口数 - 2（clk/rst 隐式）。
 
 边界与假设：
-  - 一个 .v 只含一个 module（XLS driver 单 top 产出），多 module 报错退出；
+  - 一个 .v 恰好一个 module（p4flow 已按模块拆分），多 module 报错退出；
   - 端口名必须是合法 Scala 标识符且非保留字（XLS 的 chan 名满足；检查到
     冲突立即报错，不做静默改名）；
   - 仅支持 `input/output wire [H:L] name` 形式（XLS 输出形态），不支持
@@ -72,13 +75,8 @@ class Port:
         return self.name == "rst"
 
 
-def parse_module(text: str, path: str, top: str | None = None):
-    """返回 (module 名, [Port])。
-
-    top=None：要求文件恰好一个 module（旧口径）。
-    top 指定：多模块文件（多 proc 网络）里选 `module <top>(` 的那个 ——
-    BlackBox 包的是**顶层**端口；子 proc 模块在文件里仅作为参考。
-    """
+def parse_module(text: str, path: str):
+    """返回 (module 名, [Port])。要求文件恰好一个 module（p4flow 已按模块拆分）。"""
     mods = []
     cur = None  # (name, [raw port lines])
     for lineno, line in enumerate(text.splitlines(), 1):
@@ -94,14 +92,9 @@ def parse_module(text: str, path: str, top: str | None = None):
             cur[1].append((lineno, line))
     if not mods:
         raise SystemExit(f"{path}: 未找到 module 声明")
-    if top is not None:
-        mods = [m for m in mods if m[0] == top]
-        if not mods:
-            raise SystemExit(f"{path}: 未找到 top module '{top}'"
-                             f"（文件里有：{', '.join(m[0] for m in mods[:1])} 等）")
-    elif len(mods) > 1 or cur is not None:
+    if len(mods) > 1 or cur is not None:
         raise SystemExit(f"{path}: 期望单 module（发现 {len(mods) + (1 if cur is not None else 0)} 个）"
-                         "；多模块文件请用 --top 指定顶层")
+                         "；p4flow 产物应已按「一 module 一文件」拆分")
 
     name, raws = mods[0]
     ports = []
@@ -139,10 +132,10 @@ def pascal(stem: str) -> str:
     return joined
 
 
-def emit(verilog_path: pathlib.Path, out_dir: pathlib.Path, top: str | None = None) -> pathlib.Path:
+def emit(verilog_path: pathlib.Path, out_dir: pathlib.Path) -> pathlib.Path:
     text = verilog_path.read_text(encoding="utf-8")
-    mod_name, ports = parse_module(text, str(verilog_path), top)
-    cls = pascal(verilog_path.stem)
+    mod_name, ports = parse_module(text, str(verilog_path))
+    cls = pascal(mod_name)  # 类名从 module 名派生（文件名=module 名）
 
     data_ports = [p for p in ports if not p.is_clk and not p.is_rst]
     has_clk = any(p.is_clk for p in ports)
@@ -197,23 +190,25 @@ def emit(verilog_path: pathlib.Path, out_dir: pathlib.Path, top: str | None = No
     return out_path
 
 
-def emit_sim(verilog_path: pathlib.Path, out_dir: pathlib.Path, top: str,
+def emit_sim(verilog_paths: list[pathlib.Path], out_dir: pathlib.Path, top: str,
              extra_paths: list[pathlib.Path], stem: str) -> pathlib.Path:
-    """生成 <Cls>Sim.scala：svsim 仿真入口（chisel 7，Verilator 后端 + FST 波形）。
+    """生成 <TopCls>Sim.scala：svsim 仿真入口（chisel 7，Verilator 后端 + FST 波形）。
 
-    DUT Verilog 经 ExtModule.setInline 内嵌（extra 源文件拼接在同一份 inline 里），
-    细化/仿真自包含。激励为骨架：复位 5 拍 + 空转 N 拍，波形 FST 落盘。
+    DUT = 顶层模块（ExtModule.setInline 内嵌）；全部模块文件 + extra 源
+    （xls_fifo_wrapper.sv 等）拼成同一份 inline blob，仿真自包含。
+    激励为骨架：复位 5 拍 + 空转 N 拍，波形 FST 落盘。
     """
-    cls = pascal(verilog_path.stem)
-    mod = top
-    parts = [verilog_path.read_text(encoding="utf-8")]
+    cls = pascal(top)
+    parts = [p.read_text(encoding="utf-8") for p in verilog_paths]
     for p in extra_paths:
         parts.append(p.read_text(encoding="utf-8"))
     blob = "\n\n".join(parts)
     if '"""' in blob:
-        raise SystemExit(f"{verilog_path}: Verilog 含三引号序列，无法内嵌 Scala 字符串，需手动处理")
+        raise SystemExit(f"{verilog_paths[0]}: Verilog 含三引号序列，无法内嵌 Scala 字符串，需手动处理")
 
-    ports = parse_module(verilog_path.read_text(encoding="utf-8"), str(verilog_path), top)[1]
+    top_path = next(p for p in verilog_paths
+                    if parse_module(p.read_text(encoding="utf-8"), str(p))[0] == top)
+    ports = parse_module(top_path.read_text(encoding="utf-8"), str(top_path))[1]
     data_ports = [p for p in ports if not p.is_clk and not p.is_rst]
 
     L: list[str] = []
@@ -235,12 +230,12 @@ def emit_sim(verilog_path: pathlib.Path, out_dir: pathlib.Path, top: str,
     L.append("  * ⚠️ ExtModule 端口默认带 io_ 前缀，与 XLS Verilog 裸端口名对不上 ——")
     L.append("  * 必须用 FlatIO（等价于 BlackBox 的裸端口名行为）。 */")
     L.append(f"final class {cls}SimExt extends ExtModule {{")
-    L.append(f"  override def desiredName: String = \"{mod}\"")
+    L.append(f"  override def desiredName: String = \"{top}\"")
     L.append("  val io = FlatIO(new Bundle {")
     for p in ports:
         L.append(chisel_io_line(p))
     L.append("  })")
-    L.append(f"  setInline(\"{mod}.sv\", {cls}VerilogBlob.text)")
+    L.append(f"  setInline(\"{top}.sv\", {cls}VerilogBlob.text)")
     L.append("}")
     L.append("")
     L.append("/** 内嵌 Verilog（DUT" + (" + 附加源" if extra_paths else "") + "），单份 blob 交给 firtool。 */")
@@ -353,44 +348,57 @@ def self_check(scala_path: pathlib.Path, ports) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="XLS Verilog -> Chisel BlackBox wrapper（路线 3）")
+    ap = argparse.ArgumentParser(description="XLS Verilog -> Chisel BlackBox wrapper（路线 3，一 module 一文件）")
     ap.add_argument("-o", "--out-dir", required=True, help="输出目录")
     ap.add_argument("--top", default=None,
-                    help="多模块文件（多 proc 网络）里作为 BlackBox 的顶层 module 名；"
-                         "缺省要求文件恰好一个 module")
+                    help="--with-sim 时指明顶层 module 名（SimExt 对接顶层端口）；"
+                         "单文件时可省略（取该文件唯一 module）")
     ap.add_argument("--with-sim", action="store_true",
-                    help="追加生成 <Cls>Sim.scala：svsim 仿真入口（Verilator + FST 波形），"
-                         "DUT Verilog 内嵌（ExtModule.setInline），自包含")
+                    help="追加生成 <TopCls>Sim.scala：svsim 仿真入口（Verilator + FST 波形），"
+                         "全部输入模块 + --sim-extra 拼成一份内嵌 Verilog，自包含")
     ap.add_argument("--sim-extra", action="append", default=[],
                     help="--with-sim 时附加的内嵌 Verilog 源文件（可多次，如 xls_fifo_wrapper.sv）")
-    ap.add_argument("verilogs", nargs="+", help="XLS 生成的 .v 文件")
+    ap.add_argument("--sim-stem", default=None,
+                    help="--with-sim 的默认 workspace 名（out/rtl/<stem>），缺省取首个输入文件 stem")
+    ap.add_argument("verilogs", nargs="+", help="XLS 生成的 .v 文件（一 module 一文件）")
     args = ap.parse_args()
 
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ok = 0
+    tops: list[str] = []
+    vps: list[pathlib.Path] = []
     for v in args.verilogs:
         vp = pathlib.Path(v)
         if not vp.exists():
             print(f"❌ {v}: 文件不存在", file=sys.stderr)
             return 1
-        scala = emit(vp, out_dir, args.top)
-        name, ports = parse_module(vp.read_text(encoding="utf-8"), v, args.top)
+        vps.append(vp)
+        scala = emit(vp, out_dir)
+        name, ports = parse_module(vp.read_text(encoding="utf-8"), v)
         self_check(scala, ports)
         data = sum(1 for p in ports if not p.is_clk and not p.is_rst)
         print(f"✅ {vp.name} (module {name}, {len(ports)} 端口) -> {scala} "
               f"[BB io={len(ports)}, Shell 数据端口={data}]")
-        if args.with_sim:
-            extras = [pathlib.Path(x) for x in args.sim_extra]
-            for x in extras:
-                if not x.exists():
-                    print(f"❌ --sim-extra {x}: 文件不存在", file=sys.stderr)
-                    return 1
-            stem = vp.stem
-            sim = emit_sim(vp, out_dir, name, extras, stem)
-            print(f"✅ {vp.name} -> {sim} [svsim FST 仿真入口：sbt \"rtl/runMain p4xlsrtl.{pascal(stem)}Sim\"]")
+        tops.append(name)
         ok += 1
+
+    if args.with_sim:
+        if len(vps) > 1 and not args.top:
+            raise SystemExit("--with-sim 多文件时必须 --top 指定顶层 module")
+        top = args.top or tops[0]
+        if top not in tops:
+            raise SystemExit(f"--top {top} 不在输入模块里（有：{', '.join(tops)}）")
+        extras = [pathlib.Path(x) for x in args.sim_extra]
+        for x in extras:
+            if not x.exists():
+                print(f"❌ --sim-extra {x}: 文件不存在", file=sys.stderr)
+                return 1
+        stem = args.sim_stem or vps[0].stem
+        sim = emit_sim(vps, out_dir, top, extras, stem)
+        print(f"✅ -> {sim} [svsim FST 仿真入口（top={top}）：sbt \"rtl/runMain p4xlsrtl.{pascal(top)}Sim\"]")
+
     print(f"共 {ok} 个 wrapper，全部通过自检")
     return 0
 

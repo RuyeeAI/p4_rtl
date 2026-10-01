@@ -7,7 +7,7 @@
 # 没有 jar 时回退到 classes 目录（开发态，改完 sbt compile 即可用，省去打包）。
 #
 # 外部依赖（流程会显式探测，缺哪步就 SKIP 哪步并在报告里标注）：
-#   - XLS harness 二进制：third_party/xls/bazel-bin/p4xls_harness/{ir_check_main,verilog_codegen_main}
+#   - XLS harness 二进制：../third_party/xls/bazel-bin（工程外同级 third_party/）/p4xls_harness/{ir_check_main,verilog_codegen_main}
 #     可用 P4XLS_HARNESS_DIR 覆盖；构建：scripts/bootstrap_xls_env.sh
 #   - python3 / iverilog / vvp / z3
 #

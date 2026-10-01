@@ -4,8 +4,10 @@
 # 用法（bash / zsh 均可）： source scripts/env.sh
 #
 # 设计要点
-#  - bazelisk / bazel 二进制、Bazel 输出目录全部落在工程内 .tools/ 下，
-#    不污染 ~/.cache，也便于整套删除重来。
+#  - bazelisk / bazel 二进制、Bazel 输出目录、第三方源码（third_party/）
+#    全部落在**工程外**的同级目录 $P4XLS_ROOT/../third_party/ 下：
+#    第三方仓库 + 4GB 级 bazel 输出基座留在工程内会让 IntelliJ 全量索引、
+#    卡到不可用（2026-10-01 外迁）。不污染 ~/.cache，也便于整套删除重来。
 #  - 所有走 GitHub 的下载（bazel 二进制、Bazel module 源）统一经 gh-proxy 镜像，
 #    因为直连 GitHub 实测只有 ~30KB/s，镜像可达 ~3MB/s。
 
@@ -22,15 +24,16 @@ unset _P4XLS_ENV_FILE
 export P4XLS_ROOT="$(cd "$_P4XLS_ENV_DIR/.." && pwd)"
 unset _P4XLS_ENV_DIR
 
-# ---- 工具目录 ----
-export P4XLS_TOOLS="$P4XLS_ROOT/.tools"
+# ---- 工具目录（工程外：third_party/.tools，避免 IDE 索引） ----
+export P4XLS_THIRD_PARTY="$P4XLS_ROOT/../third_party"
+export P4XLS_TOOLS="$P4XLS_THIRD_PARTY/.tools"
 case ":$PATH:" in
   *":$P4XLS_TOOLS/bin:"*) ;;
   *) export PATH="$P4XLS_TOOLS/bin:$PATH" ;;
 esac
 
-# ---- XLS 源码位置（下面要用它读 .bazelversion） ----
-export XLS_SRC="$P4XLS_ROOT/third_party/xls"
+# ---- XLS 源码位置（工程外同级 third_party/，下面要用它读 .bazelversion） ----
+export XLS_SRC="$P4XLS_THIRD_PARTY/xls"
 
 # ---- bazelisk ----
 # bazel 二进制缓存（bazelisk 下载 bazel 本身时用）

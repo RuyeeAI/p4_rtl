@@ -19,7 +19,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/third_party/xls/bazel-bin/p4xls_harness/verilog_codegen_main"
+BIN="$ROOT/../third_party/xls/bazel-bin/p4xls_harness/verilog_codegen_main"
 
 if [ $# -lt 2 ]; then
   sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'

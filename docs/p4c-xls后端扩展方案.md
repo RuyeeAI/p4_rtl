@@ -1,7 +1,7 @@
 # 在 p4c 中扩展 XLS 后端：工作分解
 
 > 目标：`P4-16 源程序 → p4c → DSLX/XLS IR → 可综合 Verilog`
-> 结论基于本地源码核对：`third_party/xls`（commit `49c163e`，2026-09-11）+ p4c main 分支实际文件结构。
+> 结论基于本地源码核对：`../third_party/xls`（commit `49c163e`，2026-09-11）+ p4c main 分支实际文件结构。
 
 **v2 修订（2026-09-15）——两项范围裁剪：**
 
@@ -46,7 +46,7 @@ P4C（自研）→ XLS IR 文本（IrText，已有）
 | 3 | Match 走 Key/Response 接口后，**XLS 侧彻底不碰存储**——这符合软硬件分工，也回避了 XLS 无存储原语的硬伤 | XLS IR 79 个 op 中无任何存储器/CAM 抽象（`xls/ir/op_list.h`） |
 | 4 | **新的头号风险：访存延迟的时序契约**。XLS `proc` 是"每拍迭代一次"的模型，外部存储器有 1–4 拍（TCAM 更多）延迟，必须用握手或显式计数状态吸收 | 见第 5 节难点 1，**建议在 M0 就验证** |
 | 5 | 建议**不把生成器写进 p4c**：p4c 只做 frontend+midend 并序列化精简 IR（JSON），生成器用 Python | p4c 构建慢（CMake+LLVM 级依赖），C++ 迭代成本高 |
-| 6 | 两边都是 **Apache-2.0**，商用无 license 障碍 | `third_party/xls/LICENSE`；p4c SPDX 头 |
+| 6 | 两边都是 **Apache-2.0**，商用无 license 障碍 | `../third_party/xls/LICENSE`；p4c SPDX 头 |
 
 **量级估算**（基于同类项目的公开经验，非承诺）：跑通 MVP **5.5–8.5 人月**；到基线评测 **8–12.5 人月**；再补 ALU 阵列与真实存储对接 **+4–8 人月**（见第 6 节）。
 
@@ -358,7 +358,7 @@ P4 源程序
 
 | 结论 | 来源 |
 |---|---|
-| XLS IR 共 79 个 op，无存储原语 | `third_party/xls/xls/ir/op_list.h` |
+| XLS IR 共 79 个 op，无存储原语 | `../third_party/xls/xls/ir/op_list.h` |
 | proc → Verilog 有正式测试 | `xls/codegen_v_1_5/codegen_proc_test.cc` |
 | 自动插流水寄存器 / ready-valid 握手 | `pipeline_register_insertion_pass.cc` / `flow_control_insertion_pass.cc` |
 | DSLX `proc{config,init,next}` + `chan`/`state` | `docs_src/dslx_reference.md` §Communicating Sequential Processes |

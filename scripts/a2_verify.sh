@@ -23,7 +23,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/third_party/xls/bazel-bin/p4xls_harness/verilog_codegen_main"
+BIN="$ROOT/../third_party/xls/bazel-bin/p4xls_harness/verilog_codegen_main"
 P4="${1:-$ROOT/testcases/p4/demo3-parser.p4}"
 STEM="$(basename "${P4%.p4}")"
 

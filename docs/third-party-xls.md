@@ -5,7 +5,7 @@
 | 项 | 值 |
 |---|---|
 | 上游 | https://github.com/google/xls |
-| 本地路径 | `third_party/xls/` |
+| 本地路径 | `../third_party/xls/` |
 | 分支 | `main` |
 | Commit | `49c163e427a54ad90dc70b7dd507212633630a21` |
 | Commit 日期 | 2026-09-11 |
@@ -37,7 +37,7 @@ Google 的 **HLS（高层次综合）工具链**：把 DSLX（类 Rust 的硬件
 远程已配好 `origin`（github 直连）与 `mirror`（镜像）。镜像通道优先：
 
 ```bash
-cd third_party/xls
+cd ../third_party/xls
 GIT_HTTP_LOW_SPEED_TIME=180 GIT_HTTP_LOW_SPEED_LIMIT=20000 \
   git -c http.version=HTTP/1.1 fetch --no-tags mirror refs/heads/main:refs/remotes/mirror/main
 git merge --ff-only refs/remotes/mirror/main

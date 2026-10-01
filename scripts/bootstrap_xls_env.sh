@@ -6,13 +6,13 @@
 # 做四件事：
 #   1. 下载 bazelisk 二进制（走 gh-proxy 镜像，直连 GitHub 实测 ~30KB/s）
 #   2. 让 bazelisk 拉取 XLS 要求的 bazel 版本（走镜像 + 固定版本绕过 GCS）
-#   3. 给 third_party/xls 打「轻量 MODULE.bazel」补丁（摘掉 OpenROAD/LLVM/PDK）
+#   3. 给 ../third_party/xls 打「轻量 MODULE.bazel」补丁（摘掉 OpenROAD/LLVM/PDK）
 #   4. 把 xls_harness 注入 XLS 源码树，并构建 ir_check_main
 #
 # 前置条件：
 #   - macOS（脚本按 darwin/arm64 取 bazelisk，其他架构会自动判断）
 #   - 已装 Xcode CLT（clang）、JDK 21+
-#   - third_party/xls 已拉取（见 docs/third-party-INDEX.md）
+#   - ../third_party/xls 已拉取（见 docs/third-party-INDEX.md）
 #
 # 用法：
 #   scripts/bootstrap_xls_env.sh              # 全流程
