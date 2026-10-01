@@ -105,7 +105,9 @@
 XLS 线出 pkt_out 通道；Chisel 线告警跳过）、
 **`// p4c: lookup-group <组名> = 表1,表2,...`**（组内 runtime 表同拍发 key/收 rsp，
 工具链校验：必须 runtime 表/至多一组/apply 相邻/写集互斥/先表写集∩后表 key 读集=∅）。
-活样本：`testcases/p4/`（demo9 综合、demo10 多 key、demo12 交换机：并行查找+deparser）。
+**样本已收敛（2026-10-01）：`testcases/p4/` 只剩 `demo12-l2l3-switch.p4`**（L2/L3
+交换机：并行查找+deparser）；demo1–11 与 a2-parser-control 及其 TB、`testcases/ir/`
+夹具已删（git 历史可查）。回归口径 = demo12 单样本。
 
 **字段单一写者原则**：顺序组合语义下后写覆盖先写 ⇒ 每个字段只由一组互斥 action 写。
 ⚠️ 更强：**同一 action 内读不到自己刚写的值**（DAG 用入口快照）——中间结果必须拆成
@@ -119,8 +121,12 @@ XLS 线出 pkt_out 通道；Chisel 线告警跳过）、
   （`P4C.Interp` 的 CLI 入口），用于 IR 级行为验证；路径口径见 IR 里的
   `// p4c-params:` / `// p4c-sinks:`，未给的输入自动填 0。
 - 表项实例的 fn dump 只出一个（按 action 名），参数取自**某一个**表项实例。
-- **本机已无 `iverilog`/`vvp`**（`/opt/homebrew/bin` 只剩 verilator + z3）
-  ⇒ `p4flow` 的仿真步骤会 SKIP。09-17 时还能跑，属环境变动。
+- **仿真引擎已切 verilator**（2026-10-01）：`Flow.stepSim` = verilator 5.030
+  `--binary --timing`（iverilog 回退保留）。**--top-module 必须给 TB**（给 DUT 名
+  = TB 剔出例化树、0 时刻结束）；TB top 正则解析、优先 `tb_` 前缀；
+  `xls_fifo_wrapper.sv` 已内嵌 jar 资源作 sim 附加源。
+- **TB 收包协议硬规矩**：发包后**一拍撤 `pkt_in_vld`**（vld 挂着会让 parser 回 ph0
+  重复收包 → 陈旧结果脉冲；iverilog 全绿可能只是调度运气）。
 
 ## 一站式入口 `p4flow`（2026-09-17）
 
@@ -157,6 +163,17 @@ XLS 线出 pkt_out 通道；Chisel 线告警跳过）、
 - 调试探针**别在 `@(posedge clk)` 打**：与 DUT 的 NBA 竞争会读到上一拍的值，
   容易把"晚一拍"误判成"读延迟 2 拍"。用 negedge。
 
-## 下一步（A3 剩余）
+## EM 迁出（2026-10-01，郝宇迁移）
 
-1. 修 EM 的 X 传播　2. LPM/TCAM 表　3. EM 接进 demo7/demo9 TB 替换 mock　4. 前端改动回灌 `../P4C`
+- **EM 整体迁至 `../HardwareDesign`**：主代码 `src/main/scala/BaseCbb/em/`
+  （ExactMatch/EmGen/EmParams/Crc + 演进出 AgeSched/AgeTable/SvcEngine/OvfTable/ForwardCam）；
+  测试 `src/test/scala/em/` 用 svsim + `TraceKind.Fst` 出 **FST 波形**
+  （chisel 7.15.0 起 svsim Verilator 后端支持 FST；`EmWaveSpec` 替代手写 TB，
+  波形落 `<workspace>/workdir-verilator/trace.fst`；`simulate()` 异常被吞，
+  **必须取 `.result`**）。chisel 版本对齐问题随之消解，本工程不再持有 chisel 依赖。
+- 本工程已删：`em/` 子工程（build.sbt em 块 + 5 个 scala）、`testcases/a3/tb_em.v`、
+  `out/a3`；root/cli 纯 Scala 不变。
+
+## 下一步
+
+1. demo12 TB 补激励　2. 前端改动回灌 `../P4C`　3. EM 后续（LPM/TCAM）在 HardwareDesign 侧推进
