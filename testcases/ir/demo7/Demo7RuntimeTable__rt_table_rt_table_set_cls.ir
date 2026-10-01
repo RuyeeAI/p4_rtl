@@ -1,9 +1,0 @@
-// p4c: package Demo7RuntimeTable
-// p4c: fn rt_table_rt_table_set_cls
-// p4c-params: in___rtarg_c=in:__rtarg.c
-// p4c-sinks: out:meta.cls:8
-package Demo7RuntimeTable
-
-fn rt_table_rt_table_set_cls(in___rtarg_c: bits[8]) -> (bits[8]) {
-  ret sinks: (bits[8]) = tuple(in___rtarg_c)
-}

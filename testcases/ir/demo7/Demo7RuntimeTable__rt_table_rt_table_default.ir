@@ -1,7 +1,0 @@
-// p4c: package Demo7RuntimeTable
-// p4c: fn rt_table_rt_table_default
-package Demo7RuntimeTable
-
-fn rt_table_rt_table_default() -> () {
-  ret sinks: () = tuple()
-}

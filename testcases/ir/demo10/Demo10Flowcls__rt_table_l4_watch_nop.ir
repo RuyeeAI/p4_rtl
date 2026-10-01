@@ -1,7 +1,0 @@
-// p4c: package Demo10Flowcls
-// p4c: fn rt_table_l4_watch_nop
-package Demo10Flowcls
-
-fn rt_table_l4_watch_nop() -> () {
-  ret sinks: () = tuple()
-}

@@ -1,9 +1,0 @@
-// p4c: package Demo10Flowcls
-// p4c: fn rt_table_l4_watch_drop_it
-// p4c-sinks: out:meta.dropFlag:8
-package Demo10Flowcls
-
-fn rt_table_l4_watch_drop_it() -> (bits[8]) {
-  n0: bits[8] = literal(value=1)
-  ret sinks: (bits[8]) = tuple(n0)
-}

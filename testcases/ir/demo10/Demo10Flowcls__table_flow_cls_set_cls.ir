@@ -1,9 +1,0 @@
-// p4c: package Demo10Flowcls
-// p4c: fn table_flow_cls_set_cls
-// p4c-sinks: out:meta.cls:8
-package Demo10Flowcls
-
-fn table_flow_cls_set_cls() -> (bits[8]) {
-  n0: bits[8] = literal(value=2)
-  ret sinks: (bits[8]) = tuple(n0)
-}
