@@ -120,12 +120,13 @@ proc 在收 rsp 的相位**同拍**应用对应 action（stall 等 rsp，查找�
 
 | 项 | 结果 |
 |---|---|
-| p4flow | 8 步 OK（sim 因无 iverilog SKIP），II=1 |
+| p4flow | 9 步 OK（含 verilator 仿真），II=1 |
+| **RTL 仿真（TB 激励）** | `testcases/a2/tb_demo12_l2l3_switch.v` **24 条断言全绿**（verilator + FST） |
 | 真 XLS parser 校验 | IR 良构、往返一致 |
 | IR lint | 通过（0 issue） |
 | 形式验证 | 11 fn：**等价 22 · 不等价 0 · 未决 0** |
 | Verilog | 828 行 / 寄存器 54 个 1242 位 |
-| 行为断言 | `demo12_verify.py` **47/47 通过** |
+| 行为断言 | `demo12_verify.py` **47/47 通过**（IR 级）+ TB **24/24**（RTL 级） |
 
 并行查找证据（IR 文本）：
 

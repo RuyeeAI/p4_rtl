@@ -64,6 +64,10 @@
 - ⚠️ **相位 0 必须清所有槽位**（含 header 数据）——state 持久，回起点 ≠ 数据回起点。
 - ⚠️ stages=2 流水化使相邻相位判据寄存器化、**永远错开一拍** → runtime 表
   **收 rsp 与应用 action 必须同拍**（2 拍：发 key → 收 rsp 同拍应用）。
+- ⚠️ **extern（Register/Counter）写有相位陷阱**：runtime 表 action 里的 extern 写谓词
+  必须 = **收 rsp 那一拍**（phRsp），不是发 key 那拍（phK）。XlsBackend 用
+  `var extPhase` 处理（runtime 分支指 phRsp；静态表就是 phK）。症状：表命中、
+  转发正常，但 Counter 永远为 0 —— **只做 IR 级断言看不出来，跑 RTL 仿真才暴露**。
 - ⚠️ **extern 写必须带 hit 谓词门控**（`array_update` 是「效果」不是数据）。
 - **runtime 表布局** `tbl_<名>_key`(send) + `tbl_<名>_rsp`(receive, `hit|actId|args`，hit 最高位)。
 - 六样本 21 case 全绿（demo2/3/5/7/9 + a2-parser-control）。

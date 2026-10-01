@@ -600,7 +600,13 @@ object XlsBackend {
           val es = extByName.getOrElse(inst, throw new P4Error(s"XlsBackend：未声明的 extern '$inst'"))
           b.arrayIndex(extCur(inst), idxNode, bitsTy(es.width), s"ar_${es.name}")
         }
-        /** extern 写：谓词 = 相位（& 附加条件如表项 hit）。同拍多次写链式后写胜出。 */
+        /** extern 写：谓词 = extPhase（& 附加条件如表项 hit）。同拍多次写链式后写胜出。
+          *
+          * ⚠️ extPhase 默认 = phK，但 **runtime 表必须改指 phRsp**：它的 action 是
+          * 在「收 rsp 那一拍」应用的（见下面 runtime 分支），而 phK 是发 key 那一拍。
+          * 用错相位 → Counter/Register 写落在 rsp 之前（读到的是上一包的值），
+          * 表现是「命中了但计数永远不涨」（demo12 TB 实测踩到）。 */
+        var extPhase: String = phK
         def extWrite(inst: String, idxNode: String, valNode: String,
                      extra: Option[String] = None): Unit = {
           val es = extByName.getOrElse(inst, throw new P4Error(s"XlsBackend：未声明的 extern '$inst'"))
@@ -608,8 +614,8 @@ object XlsBackend {
           val prev = extNext(inst)
           val upd = b.arrayUpdate(prev, valNode, idxNode, arrTy, s"au_${tag}_$inst")
           val pred = extra match {
-            case Some(p) => b.binOp("and", phK, p, "bits[1]", s"wp_${tag}_$inst")
-            case None => phK
+            case Some(p) => b.binOp("and", extPhase, p, "bits[1]", s"wp_${tag}_$inst")
+            case None => extPhase
           }
           extNext(inst) = b.sel(pred, Seq(prev, upd), Some(prev), arrTy, s"ne_${tag}_$inst")
         }
@@ -643,6 +649,8 @@ object XlsBackend {
               val base = ctrlBase + stmtPhaseBase
               val phKey = isPh(base)
               val phRsp = isPh(base + 1)   // 收 rsp + 应用 action（同一拍）
+              // ⚠️ 本语句（含 default 表项）的 extern 写必须与 action 应用同拍
+              extPhase = phRsp
 
               // key：各 key 元素的当前值 concat（先声明在高位）
               val keyElems: Seq[(String, Int)] = t.keys.map { ke =>
