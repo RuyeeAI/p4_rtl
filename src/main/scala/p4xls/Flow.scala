@@ -236,7 +236,7 @@ object Flow {
     RtlProfile(mod, regs, regBits, wires, wireBits, verilog.linesIterator.size, verilog.getBytes(StandardCharsets.UTF_8).length.toLong, ports)
   }
 
-  /** 没自带 TB 时生成一个可编译的骨架：接时钟复位、驱动输入、打输出、dump VCD。 */
+  /** 没自带 TB 时生成一个可编译的骨架：接时钟复位、驱动输入、打输出、dump FST。 */
   def tbSkeleton(top: String, ports: Seq[VPort], stem: String): String = {
     // ⚠️ 标识符必须合法：stem 里常有 `-`（demo2-match），直接拼进 module 名是语法错误
     // ⚠️ 用显式行列表拼接：Scala 的三引号字符串**不处理 `\n` 转义**，写在里面会变成字面量
@@ -259,7 +259,7 @@ object Flow {
     L += ""
     L += "  integer errors = 0;"
     L += "  initial begin"
-    L += s"""    $$dumpfile("tb_$ident.vcd");"""
+    L += s"""    $$dumpfile("tb_$ident.fst");"""
     L += s"    $$dumpvars(1, tb_$ident);"
     L += "    rst = 1; repeat (5) @(posedge clk); @(negedge clk); rst = 0;"
     L += "    // TODO 激励：给输入端口赋值并检查输出"
@@ -549,9 +549,12 @@ object Flow {
           val failN = log2.linesIterator.count(_.contains("[FAIL]"))
           val verdict = log2.linesIterator.find(l => l.contains("结果：")).map(_.trim).getOrElse("")
           val st = if (rc2 != 0 || failN > 0) Status.Fail else if (tbIsSkeleton) Status.Warn else Status.Ok
+          val wave =
+            if (engine != "verilator") ""
+            else s" · FST 波形 tb_${ctx.cfg.stem}.fst（sim 目录）"
           ctx.add(Step("sim", if (tbIsSkeleton) s"仿真模型（$engine，骨架未自检）" else s"仿真模型（$engine）", st,
             (if (tbIsSkeleton) "自动生成 TB 骨架，激励待补" else s"用例 ok=$okN fail=$failN") +
-              (if (verdict.nonEmpty) s" · $verdict" else ""),
+              (if (verdict.nonEmpty) s" · $verdict" else "") + wave,
             ms(t), tail(log2, 8)))
         }
 
@@ -579,22 +582,30 @@ object Flow {
           val srcs = (Seq(simV, tbFile) ++ extraSrc).map(_.toString)
           val runScript = ctx.dirSim.resolve("run.sh")
           Files.write(runScript, s"""#!/usr/bin/env bash
-# 一键跑这个仿真模型（由 p4flow 生成；引擎 verilator --binary --timing）
+# 一键跑这个仿真模型（由 p4flow 生成；引擎 verilator --binary --timing，FST 波形）
 set -euo pipefail
 cd "$$(dirname "$$0")"
-verilator --binary --timing --top-module $simTop -Wno-fatal \\
+verilator --binary --timing --trace-fst --top-module $simTop -Wno-fatal \\
   --Mdir obj_dir -o $binName ${srcs.map(p => new java.io.File(p).getName).mkString(" ")}
 ./obj_dir/$binName
 """.getBytes(StandardCharsets.UTF_8))
           // 编译（含 C++ 模型构建，首次较慢 → 单独长超时）
-          val (rc1, log1) = sh(Seq("verilator", "--binary", "--timing", "--top-module", simTop,
+          val (rc1, log1) = sh(Seq("verilator", "--binary", "--timing", "--trace-fst", "--top-module", simTop,
             "-Wno-fatal", "--Mdir", objDir.toString, "-o", binName) ++ srcs, ctx.cfg.repoRoot, 600)
           if (rc1 != 0) {
             ctx.add(Step("sim", "仿真模型（verilator 编译）", Status.Fail, s"verilator 退出码 $rc1", ms(t), tail(log1, 12)))
             return
           }
           val simBin = objDir.resolve(binName)
-          val (rc2, log2) = sh(Seq(simBin.toString), ctx.cfg.repoRoot, ctx.cfg.simTimeoutSec)
+          if (!Files.exists(simBin)) {
+            // 编译退出码 0 但二进制缺失（偶发的 make 中断态）：如实报 Fail，可重跑
+            ctx.add(Step("sim", "仿真模型（verilator 编译）", Status.Fail,
+              "verilator 退出码 0 但仿真二进制未产出（构建中断？请重跑）", ms(t), tail(log1, 12)))
+            return
+          }
+          // ⚠️ cwd 换成 sim 目录后，程序路径必须**绝对**（相对路径会按新 cwd 解析）
+          // cwd = sim 目录：骨架 TB 的 $dumpfile("tb_<stem>.fst") 落在本目录
+          val (rc2, log2) = sh(Seq(simBin.toAbsolutePath.toString), ctx.dirSim.toAbsolutePath, ctx.cfg.simTimeoutSec)
           runAndJudge(rc2, log2, "verilator")
         } else {
           val runScript = ctx.dirSim.resolve("run.sh")

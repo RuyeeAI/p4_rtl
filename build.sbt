@@ -63,3 +63,36 @@ lazy val cli = (project in file("cli"))
 // 注：EM（外部表匹配模块）已迁至 ../HardwareDesign 维护
 //（src/main/scala/BaseCbb/em/，含 svsim + FST 波形的 Scala 侧仿真），
 // 本工程不再持有 em 子工程，root/cli 保持纯 Scala。
+
+// ---------------------------------------------------------------------------
+// rtl —— 路线 3 的 Chisel 集成与仿真。
+//
+// Chisel 版本与 ../HardwareDesign 对齐（chisel 7.15.0 / scala 2.13.16）：
+// gen_chisel_wrapper.py 生成的 BlackBox/Shell 放在 rtl/src/main/scala/p4xlsrtl/，
+// `--with-sim` 生成的 svsim 仿真入口（ExtModule 内嵌 Verilog + FST 波形）跑法：
+//   sbt "rtl/runMain p4xlsrtl.<Cls>Sim" [拍数]
+// 波形落 <workspace>/workdir-verilator/trace.fst（chisel 7 起 svsim Verilator
+// 后端支持 FST；5.3/6.x 只有 VCD）。
+// 独立子工程，root/cli 保持纯 Scala（fat jar 不受影响）。
+// ---------------------------------------------------------------------------
+lazy val rtl = (project in file("rtl"))
+  .settings(
+    name := "p4xls-rtl",
+    scalaVersion := "2.13.16",
+    // chisel 7.15.0 的传递依赖带 scala-library 2.13.18；sbt 1.12 按 SIP-51 要求
+    // 编译器 ≥ 库版本。HardwareDesign（sbt 1.9.7 无此检查）实际就是 2.13.16 编译器
+    // + 2.13.18 库的组合，这里显式声明同一行为。
+    allowUnsafeScalaLibUpgrade := true,
+    libraryDependencies ++= Seq(
+      "org.chipsalliance" %% "chisel" % "7.15.0",
+      "org.scalatest" %% "scalatest" % "3.2.20" % "test",
+    ),
+    addCompilerPlugin("org.chipsalliance" % "chisel-plugin" % "7.15.0" cross CrossVersion.full),
+    scalacOptions ++= Seq(
+      "-language:reflectiveCalls",
+      "-deprecation",
+      "-feature",
+      "-Xcheckinit",
+      "-Ymacro-annotations",
+    ),
+  )
