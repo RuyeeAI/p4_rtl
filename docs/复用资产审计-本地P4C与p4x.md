@@ -3,6 +3,7 @@
 > 审计对象：`Code-Repos/P4C`（自研 P4→Chisel 编译器）、`Code-Repos/p4x`（工具链统一入口）
 > 目的：评估在 `p4_rtl`（P4→RTL）方向上有多少现成代码可直接用
 > 日期：2026-09-15
+> **复审与合并：2026-10-01/02（见 §10，本节为最新结论）**
 
 ---
 
@@ -228,3 +229,32 @@ generated/p4c/Demo5Pipeline.scala（157 行）
 2. **收口 p4x/dist 的 dylib 依赖**，让验证环境可移植。
 3. 把 `p4x` 纳入 git，与 `P4C` 统一版本管理。
 4. A0 通过后，按 A2 → A3 顺序推进 `XlsBackend`。
+
+---
+
+## 10. 2026-10-01/02 复审与合并结论
+
+P4C 的 2,900 行早已 fork 进本工程（`src/main/scala/P4C/`，§5 的复用已全部落地）。
+本轮重看 `../p4x`，按「对 `p4_rtl` 还有无价值」重新定性：
+
+| p4x 资产 | 判定 | 处置 |
+|---|---|---|
+| `packaging/*.sh` + `compat/bmv2_apple_portability.h` | ✅ **收编** | 官方 p4c + bmv2 在 macOS/arm64 的构建配方（含 6 处上游缺陷规避），A5 黄金链唯一可复现路径 → `p4_rtl/packaging/`，路径改指 `../third_party/`、产物落 `../third_party/dist` |
+| `p4x sim`（`p4xlib/sim.py`：pcap 进/出 + bmv2 `--use-files` 无头仿真） | ✅ **接入** | 新增 `scripts/golden_sim.sh`（A5 第一级 golden 入口），工具链经 `P4X_HOME` 引用 `../p4x/dist` |
+| `dist/` 预编译工具链（75MB：p4c-bm2-ss / simple_switch / p4include） | 🔗 **引用不拷贝** | 二进制 + 绝对路径 dylib，进工程会让 IDE/仓库退化；保留 `../p4x/dist`，需时用 packaging 配方重建 |
+| `p4x chisel` | ❌ 取代 | 本工程 `p4flow` + fat jar（`p4xls.jar`）已覆盖 |
+| `p4x ppal` | ⏸ 暂缓 | 依赖旧 `p4chisel.jar` 的 Tier1 估算模型；本工程已有 IR/RTL 资源报告口径 |
+| `p4xlib/{config,cli}.py`、`doctor` | ❌ 取代 | `p4flow` 自带外部依赖探测与分步报告 |
+| `examples/l2_fwd.p4` | ❌ 无价值 | 仅作 golden 链路自检样本 |
+
+**实测结论（重要）**：
+
+1. 黄金链本身可用 —— `scripts/golden_sim.sh ../p4x/examples/l2_fwd.p4` 正常产出
+   bmv2 JSON + port0→port1 的转发帧（内容与输入一致）。
+2. **本工程样本过不了官方 p4c**：`testcases/p4/demo12-l2l3-switch.p4` 在
+   `p4c-bm2-ss` 下报 `syntax error, unexpected IDENTIFIER ... Register`（自研子集的
+   顶层 `Register`/`Counter` extern 写法非 v1model 语法）。即 A5 对拍**必须先补
+   「官方可编译变体样本」**——这是 A5 剩余工作量的一部分，不是工具链问题。
+3. p4x 侧踩到一个真 bug：`sim` 以输出目录为 cwd 启动 `simple_switch`，但 bmv2 JSON
+   传的是调用方相对路径 → `JSON input file cannot be opened`（相对 `-o` 必现）。
+   `scripts/golden_sim.sh` 已统一把 `-o` 转绝对路径规避（注释里记了出处）。
