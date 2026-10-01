@@ -1,28 +1,29 @@
 // demo12：二层/三层混合交换机 —— 并行查找 + 合并仲裁 + 报文编辑 + 报文重组
-//          **v4：可选封装**（1 层 OpaqueTag + 最多 4 层 VLAN）
+//          **v4：可选封装**（1 层 OpaqueTag + 0..4 层 **802.1Q VLAN**）
 //
-// 与 v3 的差异（本次新增）：报文格式支持**可选存在**的封装层：
-//   Ethernet → [OpaqueTag] → [VLAN ×0..4] → IPv4 → (UDP | TCP)
-// 并在 ingress 里真正用起来：
-//   - classify 解析封装链：otagV / vlanDepth / innerVid / isIpv4
-//   - mac_table 按 **(目的 MAC, 内层 VID)** 查找（二层转发的标准做法）
-//   - rewrite 做 VLAN 编辑：L3 上联口**打外层 VLAN**（trunk）、
-//     L2 用户口**剥外层 VLAN**（access）
+// 与 v3 的差异（本次新增）：报文格式支持**层数可选**的封装：
+//   Ethernet → [OpaqueTag] → [802.1Q VLAN × 0..4] → ethertype → IPv4 → (UDP | TCP)
+// 并在 ingress 里按层数分别处理（这才是"可选"的落点）：
+//   - classify 解析封装链：otagV / vlanDepth(0..4) / innerVid / isIpv4
+//   - mac_table 按 **(目的 MAC, 内层 VID)** 查找（二层转发按 VLAN 隔离）
+//   - rewrite 依当前层数做 VLAN 增删：
+//       L3 上联口（trunk）：层数 < 4 才**加一层**外层 VLAN（满 4 层 ⇒ 饱和保护，不动）
+//       L2 用户口（access）：层数 > 0 才**剥一层**外层 VLAN（0 层 ⇒ 无可剥，不动）
 //
 // ⚠️ 子集限制与应对（无 header stack / setValid / 变长 extract）：
 //   「可选」封装按**固定槽位**实现 —— 每个可选层占一个固定偏移的槽位，
-//   不存在时槽位为全 0，存在与否由该槽位自身的 TPID 判定。这要求入包缓冲是
-//   **归一化到最坏布局**的（缺的层补 0），也正是多数交换芯片内部报文总线的形态。
-//   代价：不存在的层仍占带宽；收益：parser 偏移恒定（子集硬约束）。
-//   每个可选层自带 `nextType`（下一层的 ethertype），使存在链可在固定偏移下判定。
+//   不存在时槽位为全 0，存在与否由该槽位自身的 TPID 判定 ⇒ 层数天然可选（0..4）。
+//   这要求入包缓冲**归一化到最坏布局**（缺的层补 0），也正是多数交换芯片内部
+//   报文总线的形态。802.1Q 标签内部没有"下一层类型"字段，故标签链末端单独放一个
+//   2 字节 `etype`（等价于真实帧里最后一个标签之后的那 2 字节）。
 //
 // 处理流水（拍数按 proc 相位）：
-//   parser(eth → otag → vlan0..3 → ipv4 → udp/tcp，固定槽位)
+//   parser(eth → otag → vlan0..3 → etype → ipv4 → udp/tcp，固定槽位)
 //   → classify()          封装链解析 + 预分类（isL3）+ 清理决策字段
 //   → mac_table  ┐        runtime 表，并行查找组 g0：同拍发 key / 同拍收 rsp
 //   → route_table┘        命中结果写入各自的决策字段
-//   → resolve()           合并仲裁（L3 > L2 > 泛洪），只写决策字段
-//   → rewrite()           报文编辑（MAC / TTL / 校验和 / **VLAN 增删**）+ 字节统计
+//   → resolve()           合并仲裁（L3 > L2 > 泛洪）+ **VLAN 增删决策**（doPush/doPop）
+//   → rewrite()           报文编辑（MAC / TTL / 校验和 / **VLAN 搬移**）+ 字节统计
 //   → ttl_guard           静态表：路由后 TTL == 0 ⇒ 丢弃
 //   → Deparser            emit 序重组报文
 //
@@ -32,9 +33,9 @@
 //   - 表 key 只能是字段路径 ⇒ L3 是 /32 主机路由（无 LPM）
 #include <core.p4>
 
-// p4c: pkt-window 800
-//   固定槽位最坏布局（按**字段字节对齐**累加，见下）= eth14B + otag8B + vlan×4 32B
-//   + ipv4 22B + tcp 22B = 98 字节 = 784 位
+// p4c: pkt-window 640
+//   固定槽位最坏布局 = eth14B + otag6B + vlan×4 16B + etype2B + ipv4 20B + tcp20B
+//                    = 78 字节 = 624 位（取 640 留余量）
 
 // ---------------- 协议常量 ----------------
 const bit<16> ET_IPV4   = 16w0x0800;
@@ -42,8 +43,8 @@ const bit<16> ET_ARP    = 16w0x0806;
 const bit<8>  PROTO_UDP = 8w17;
 const bit<8>  PROTO_TCP = 8w6;
 
-const bit<16> TPID_VLAN = 16w0x8100;   // VLAN 槽位标识
-const bit<16> TPID_OTAG = 16w0x8200;   // OpaqueTag 槽位标识（带内元数据：源端口等）
+const bit<16> TPID_VLAN = 16w0x8100;   // 802.1Q（VLAN 槽位标识）
+const bit<16> TPID_OTAG = 16w0x8200;   // OpaqueTag 槽位标识（内部带内元数据）
 
 // ---------------- 转发类型 / 丢弃原因 ----------------
 const bit<8> FWD_L2    = 8w1;
@@ -62,7 +63,7 @@ const bit<48> NH_MAC_3   = 48w0x00deadbeef01;   // 10.0.0.3 的下一跳 MAC
 
 // 端口 0 = 上联口（L3 出口，trunk 带 VLAN），端口 1..3 = 用户接入口（access 不带 VLAN）
 const bit<16> PM_FLOOD   = 16w0x000e;           // 泛洪掩码：端口 1/2/3（不含上联）
-const bit<16> UPLINK_VID = 16w100;              // 上联口出方向打的外层 VLAN
+const bit<12> UPLINK_VID = 12w100;              // 上联口出方向打的外层 VLAN
 
 // ---------------- headers ----------------
 header ethernet_h {
@@ -71,25 +72,27 @@ header ethernet_h {
     bit<16> etherType;
 }
 
-// OpaqueTag：交换机内部带内标签（源端口 / 入 VLAN / 时间戳等，Demo 带 32 位数据）
-// 固定槽位口径：tpid = TPID_OTAG 表示本层存在；nextType 指向下一层。
-// ⚠️ 报文窗口按**字段**逐字节对齐累加（M3 子集：偏移以字节为单位），
-//    故字段宽度都取 8 的倍数，避免槽位里出现无用填充字节。
+// OpaqueTag（交换机内部带内标签：源端口 / 入 VLAN / 时间戳等）。
+// 它是**自定义**标签，故带 nextType —— 用于"VLAN 全剥光后"指回 payload 类型。
 header opaquetag_h {
     bit<16> tpid;
     bit<16> nextType;
-    bit<32> tagData;
+    bit<16> tagData;
 }
 
-// VLAN 标签：tpid + nextType + pcp/dei/vid。nextType 是子集下判定"后面还有没有
-// VLAN"的唯一手段（无法变长解析）。pcp/dei/vid 各占一字节（同上：字段字节对齐），
-// 单槽 8 字节；这是本 Demo 为"可选封装 + 固定偏移"付出的带宽代价。
+// **802.1Q VLAN 标签**（标准 4 字节）：TPID(16) + TCI(16) = PCP(3) | DEI(1) | VID(12)。
+// 标签内部没有"下一层类型"字段（真实帧里它就在下一个标签/etype 的位置），
+// 固定槽位下由下一个槽位的 TPID 或链末端的 `etype` 承接这一语义。
 header vlan_h {
     bit<16> tpid;
-    bit<16> nextType;
-    bit<8>  pcp;
-    bit<8>  dei;
-    bit<16> vid;
+    bit<3>  pcp;
+    bit<1>  dei;
+    bit<12> vid;
+}
+
+// 标签链末端承载的 ethertype（等价于真实帧里最后一个标签之后的那 2 字节）
+header etype_h {
+    bit<16> value;
 }
 
 header ipv4_h {
@@ -136,6 +139,7 @@ struct headers_t {
     vlan_h      vlan1;
     vlan_h      vlan2;
     vlan_h      vlan3;
+    etype_h     etype;
     ipv4_h      ipv4;
     udp_h       udp;
     tcp_h       tcp;
@@ -144,14 +148,14 @@ struct headers_t {
 // 决策信息（内部，不进对外报文 —— 见 Deparser 的 emit 清单）
 struct metadata_t {
     // 预分类（classify 写）
-    bit<8>  isL3;       // 门控位：目的 MAC == 交换机 MAC 且是 IPv4 ⇒ 该查路由表
-    bit<8>  isIpv4;     // 封装链末端指向 IPv4
+    bit<8>  isL3;       // 门控位：目的 MAC == 交换机 MAC 且标签链末端指向 IPv4
+    bit<8>  isIpv4;
     bit<16> ipLen;      // IPv4 totalLen（非 IPv4 包该槽位为 0）
     bit<8>  dropReason;
     // 封装链解析（classify 写）
     bit<8>  otagV;      // OpaqueTag 存在
     bit<4>  vlanDepth;  // VLAN 层数 0..4
-    bit<16> innerVid;   // 最内层 VLAN 的 VID（无 VLAN 时为 0）
+    bit<12> innerVid;   // 最内层 VLAN 的 VID（无 VLAN 时为 0）
     // mac_table 查找结果
     bit<8>  macHit;
     bit<4>  macPort;
@@ -160,15 +164,17 @@ struct metadata_t {
     bit<4>  rtPort;
     bit<48> rtDstMac;   // 下一跳 MAC（编辑后的目的 MAC）
     bit<48> rtSrcMac;   // 重写后的源 MAC
-    // 合并仲裁（resolve 写）
+    // 合并仲裁 + VLAN 增删决策（resolve 写）
     bit<8>  fwdType;    // FWD_*
     bit<16> outPort;    // 出端口位图（单播 = 独热，泛洪 = 掩码）
     bit<4>  outPortIdx; // 出端口号（泛洪 = 15）
+    bit<8>  doPush;     // trunk 上联：加一层外层 VLAN（层数 < 4 才成立）
+    bit<8>  doPop;      // access 用户口：剥一层外层 VLAN（层数 > 0 才成立）
 }
 
 // ---------------- parser ----------------
 // ⚠️ 固定槽位：每个可选层都在**同一偏移**上无条件 extract（子集不支持变长），
-//    层是否存在由槽位自身的 tpid 在 ingress 里判定。
+//    层是否存在由槽位自身的 tpid 在 ingress 里判定 ⇒ 层数天然可选（0..4）。
 parser Top(packet_in pkt, out headers_t hdr) {
     state start {
         transition parse_ethernet;
@@ -201,6 +207,11 @@ parser Top(packet_in pkt, out headers_t hdr) {
 
     state parse_vlan3 {
         pkt.extract(hdr.vlan3);
+        transition parse_etype;
+    }
+
+    state parse_etype {
+        pkt.extract(hdr.etype);
         transition parse_ipv4;
     }
 
@@ -232,35 +243,22 @@ control Ingress(inout headers_t hdr, inout metadata_t meta) {
 
     // ---- 预分类 + 封装链解析：只看报文字段，不依赖任何表 ⇒ 并行查找的前提 ----
     action classify() {
-        // ① 封装链存在性：槽位恒在，存在 ⇔ 槽位自身的 tpid 命中
+        // ① 存在性：槽位恒在，存在 ⇔ 槽位自身的 tpid 命中（层数由此天然可选）
         meta.otagV = (hdr.otag.tpid == TPID_OTAG) ? 8w1 : 8w0;
         meta.vlanDepth = ((hdr.vlan0.tpid == TPID_VLAN) ? 4w1 : 4w0)
                        + ((hdr.vlan1.tpid == TPID_VLAN) ? 4w1 : 4w0)
                        + ((hdr.vlan2.tpid == TPID_VLAN) ? 4w1 : 4w0)
                        + ((hdr.vlan3.tpid == TPID_VLAN) ? 4w1 : 4w0);
-        // ② 最内层 VLAN 的 VID（从内层往外找第一个存在的槽位）
+        // ② 最内层 VLAN 的 VID（从内往外找第一个存在的槽位）
         meta.innerVid = (hdr.vlan3.tpid == TPID_VLAN) ? hdr.vlan3.vid
                       : (hdr.vlan2.tpid == TPID_VLAN) ? hdr.vlan2.vid
                       : (hdr.vlan1.tpid == TPID_VLAN) ? hdr.vlan1.vid
-                      : (hdr.vlan0.tpid == TPID_VLAN) ? hdr.vlan0.vid : 16w0;
-        // ③ 封装链末端的 nextType（最内层存在的标签指向的类型；无标签则 etherType）
-        meta.isIpv4 = ((((hdr.vlan3.tpid == TPID_VLAN) ? hdr.vlan3.nextType
-                       : (hdr.vlan2.tpid == TPID_VLAN) ? hdr.vlan2.nextType
-                       : (hdr.vlan1.tpid == TPID_VLAN) ? hdr.vlan1.nextType
-                       : (hdr.vlan0.tpid == TPID_VLAN) ? hdr.vlan0.nextType
-                       : (hdr.otag.tpid  == TPID_OTAG) ? hdr.otag.nextType
-                       : hdr.ethernet.etherType)) == ET_IPV4) ? 8w1 : 8w0;
-        // ④ 三层门控：目的 MAC == 交换机 MAC 且确实是 IPv4
-        // ⚠️ 不能写 `meta.isIpv4 == 8w1` —— 同一 action 内读自己刚写的字段，
-        //    读到的是**入口快照**（W1 顺序组合语义），恒为 0 ⇒ isL3 永远不成立。
-        //    必须把封装链判定**内联**到本表达式里。
+                      : (hdr.vlan0.tpid == TPID_VLAN) ? hdr.vlan0.vid : 12w0;
+        // ③ 标签链末端指向的类型（802.1Q 内部没有该字段 ⇒ 由链末端 etype 承接）
+        meta.isIpv4 = (hdr.etype.value == ET_IPV4) ? 8w1 : 8w0;
+        // ④ 三层门控（读报文字段，不存在"读自己刚写的值"问题）
         meta.isL3 = ((hdr.ethernet.dstAddr == SWITCH_MAC)
-                     && ((((hdr.vlan3.tpid == TPID_VLAN) ? hdr.vlan3.nextType
-                         : (hdr.vlan2.tpid == TPID_VLAN) ? hdr.vlan2.nextType
-                         : (hdr.vlan1.tpid == TPID_VLAN) ? hdr.vlan1.nextType
-                         : (hdr.vlan0.tpid == TPID_VLAN) ? hdr.vlan0.nextType
-                         : (hdr.otag.tpid  == TPID_OTAG) ? hdr.otag.nextType
-                         : hdr.ethernet.etherType)) == ET_IPV4)) ? 8w1 : 8w0;
+                     && (hdr.etype.value == ET_IPV4)) ? 8w1 : 8w0;
         meta.ipLen = hdr.ipv4.totalLen;             // 非 IPv4 包该槽位为 0
         meta.dropReason = DROP_NONE;
         meta.macHit = 8w0;
@@ -289,10 +287,9 @@ control Ingress(inout headers_t hdr, inout metadata_t meta) {
         meta.rtHit = 8w0;
     }
 
-    // ---- 阶段 1：合并仲裁（只写决策字段）----
-    // 决策优先级：L3 命中 > L2 命中 > 泛洪（两条查找并行发出，必须在此合并）。
-    // ⚠️ 同一 action 内后一条语句读到的是**入口快照**，不是本 action 前面刚写的值
-    //（W1 顺序组合语义）—— 所以统计/编辑必须放到下一个 action（rewrite）。
+    // ---- 阶段 1：合并仲裁 + VLAN 增删决策（只写决策字段）----
+    // ⚠️ 同一 action 内读到的是**入口快照**，故 doPush/doPop 必须由表结果
+    //（rtHit/macHit，上一相位写入）直接判定，不能读本 action 刚写的 fwdType。
     action resolve() {
         meta.fwdType = (meta.rtHit == 8w1) ? FWD_L3
                      : ((meta.macHit == 8w1) ? FWD_L2 : FWD_FLOOD);
@@ -300,6 +297,11 @@ control Ingress(inout headers_t hdr, inout metadata_t meta) {
                         : ((meta.macHit == 8w1) ? meta.macPort : 4w15);
         meta.outPort = (meta.rtHit == 8w1) ? (16w1 << meta.rtPort)
                      : ((meta.macHit == 8w1) ? (16w1 << meta.macPort) : PM_FLOOD);
+        // trunk 上联：加一层；**满 4 层 ⇒ 饱和保护不加**（层数可选的边界情形）
+        meta.doPush = ((meta.rtHit == 8w1) && (meta.vlanDepth != 4w4)) ? 8w1 : 8w0;
+        // access 用户口：剥一层；**0 层 ⇒ 无可剥**
+        meta.doPop = ((meta.rtHit != 8w1) && (meta.macHit == 8w1)
+                      && (meta.vlanDepth != 4w0)) ? 8w1 : 8w0;
     }
 
     // ---- 阶段 2：报文编辑 + 统计（读 resolve 的决策结果）----
@@ -318,74 +320,66 @@ control Ingress(inout headers_t hdr, inout metadata_t meta) {
         hdr.ethernet.dstAddr = (meta.rtHit == 8w1) ? meta.rtDstMac : hdr.ethernet.dstAddr;
         hdr.ethernet.srcAddr = (meta.rtHit == 8w1) ? meta.rtSrcMac : hdr.ethernet.srcAddr;
 
-        // ④ VLAN 编辑（固定槽位 ⇒ 增删 = 槽位内容搬移，全部用三元门控）
-        //    L3 走**上联口**（trunk）⇒ 打外层 VLAN（UPLINK_VID）；
-        //    L2 走**用户口**（access）⇒ 剥外层 VLAN（若存在）。
-        //    ⚠️ 同一 action 内读的是入口快照 ⇒ 整槽搬移正是我们需要的语义：
-        //       push：vlan3←vlan2、vlan2←vlan1、vlan1←vlan0、vlan0←新标签
-        //       pop ：vlan0←vlan1、vlan1←vlan2、vlan2←vlan3、vlan3←0
-        //    前者需要"上一层指向的类型"（prevType），后者需要"被剥层的 nextType"。
-        hdr.vlan3.tpid = ((meta.fwdType == FWD_L3) ? hdr.vlan2.tpid
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? 16w0 : hdr.vlan3.tpid));
-        hdr.vlan3.nextType = ((meta.fwdType == FWD_L3) ? hdr.vlan2.nextType
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? 16w0 : hdr.vlan3.nextType));
-        hdr.vlan3.pcp = ((meta.fwdType == FWD_L3) ? hdr.vlan2.pcp
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? 8w0 : hdr.vlan3.pcp));
-        hdr.vlan3.dei = ((meta.fwdType == FWD_L3) ? hdr.vlan2.dei
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? 8w0 : hdr.vlan3.dei));
-        hdr.vlan3.vid = ((meta.fwdType == FWD_L3) ? hdr.vlan2.vid
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? 16w0 : hdr.vlan3.vid));
+        // ④ VLAN 增删（802.1Q 4B 槽位内容搬移）：
+        //    push：vlan3←vlan2、vlan2←vlan1、vlan1←vlan0、vlan0←新标签
+        //    pop ：vlan0←vlan1、vlan1←vlan2、vlan2←vlan3、vlan3←0
+        //    ⚠️ 同一 action 内读的是入口快照 ⇒ 整槽搬移正是所需语义。
+        hdr.vlan3.tpid = (meta.doPush == 8w1) ? hdr.vlan2.tpid
+                       : ((meta.doPop == 8w1) ? 16w0 : hdr.vlan3.tpid);
+        hdr.vlan3.pcp = (meta.doPush == 8w1) ? hdr.vlan2.pcp
+                       : ((meta.doPop == 8w1) ? 3w0 : hdr.vlan3.pcp);
+        hdr.vlan3.dei = (meta.doPush == 8w1) ? hdr.vlan2.dei
+                       : ((meta.doPop == 8w1) ? 1w0 : hdr.vlan3.dei);
+        hdr.vlan3.vid = (meta.doPush == 8w1) ? hdr.vlan2.vid
+                       : ((meta.doPop == 8w1) ? 12w0 : hdr.vlan3.vid);
 
-        hdr.vlan2.tpid = ((meta.fwdType == FWD_L3) ? hdr.vlan1.tpid
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan3.tpid : hdr.vlan2.tpid));
-        hdr.vlan2.nextType = ((meta.fwdType == FWD_L3) ? hdr.vlan1.nextType
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan3.nextType : hdr.vlan2.nextType));
-        hdr.vlan2.pcp = ((meta.fwdType == FWD_L3) ? hdr.vlan1.pcp
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan3.pcp : hdr.vlan2.pcp));
-        hdr.vlan2.dei = ((meta.fwdType == FWD_L3) ? hdr.vlan1.dei
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan3.dei : hdr.vlan2.dei));
-        hdr.vlan2.vid = ((meta.fwdType == FWD_L3) ? hdr.vlan1.vid
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan3.vid : hdr.vlan2.vid));
+        hdr.vlan2.tpid = (meta.doPush == 8w1) ? hdr.vlan1.tpid
+                       : ((meta.doPop == 8w1) ? hdr.vlan3.tpid : hdr.vlan2.tpid);
+        hdr.vlan2.pcp = (meta.doPush == 8w1) ? hdr.vlan1.pcp
+                       : ((meta.doPop == 8w1) ? hdr.vlan3.pcp : hdr.vlan2.pcp);
+        hdr.vlan2.dei = (meta.doPush == 8w1) ? hdr.vlan1.dei
+                       : ((meta.doPop == 8w1) ? hdr.vlan3.dei : hdr.vlan2.dei);
+        hdr.vlan2.vid = (meta.doPush == 8w1) ? hdr.vlan1.vid
+                       : ((meta.doPop == 8w1) ? hdr.vlan3.vid : hdr.vlan2.vid);
 
-        hdr.vlan1.tpid = ((meta.fwdType == FWD_L3) ? hdr.vlan0.tpid
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan2.tpid : hdr.vlan1.tpid));
-        hdr.vlan1.nextType = ((meta.fwdType == FWD_L3) ? hdr.vlan0.nextType
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan2.nextType : hdr.vlan1.nextType));
-        hdr.vlan1.pcp = ((meta.fwdType == FWD_L3) ? hdr.vlan0.pcp
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan2.pcp : hdr.vlan1.pcp));
-        hdr.vlan1.dei = ((meta.fwdType == FWD_L3) ? hdr.vlan0.dei
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan2.dei : hdr.vlan1.dei));
-        hdr.vlan1.vid = ((meta.fwdType == FWD_L3) ? hdr.vlan0.vid
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan2.vid : hdr.vlan1.vid));
+        hdr.vlan1.tpid = (meta.doPush == 8w1) ? hdr.vlan0.tpid
+                       : ((meta.doPop == 8w1) ? hdr.vlan2.tpid : hdr.vlan1.tpid);
+        hdr.vlan1.pcp = (meta.doPush == 8w1) ? hdr.vlan0.pcp
+                       : ((meta.doPop == 8w1) ? hdr.vlan2.pcp : hdr.vlan1.pcp);
+        hdr.vlan1.dei = (meta.doPush == 8w1) ? hdr.vlan0.dei
+                       : ((meta.doPop == 8w1) ? hdr.vlan2.dei : hdr.vlan1.dei);
+        hdr.vlan1.vid = (meta.doPush == 8w1) ? hdr.vlan0.vid
+                       : ((meta.doPop == 8w1) ? hdr.vlan2.vid : hdr.vlan1.vid);
 
-        // vlan0：push 时写新标签（nextType = 原来上一层指向的类型，vid = UPLINK_VID）
-        hdr.vlan0.tpid = ((meta.fwdType == FWD_L3) ? TPID_VLAN
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan1.tpid : hdr.vlan0.tpid));
-        hdr.vlan0.nextType = ((meta.fwdType == FWD_L3)
-                       ? ((hdr.otag.tpid == TPID_OTAG) ? hdr.otag.nextType : hdr.ethernet.etherType)
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan1.nextType : hdr.vlan0.nextType));
-        hdr.vlan0.pcp = ((meta.fwdType == FWD_L3) ? 8w0
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan1.pcp : hdr.vlan0.pcp));
-        hdr.vlan0.dei = ((meta.fwdType == FWD_L3) ? 8w0
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan1.dei : hdr.vlan0.dei));
-        hdr.vlan0.vid = ((meta.fwdType == FWD_L3) ? UPLINK_VID
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0) ? hdr.vlan1.vid : hdr.vlan0.vid));
+        // vlan0：push 时写新标签（UPLINK_VID）
+        hdr.vlan0.tpid = (meta.doPush == 8w1) ? TPID_VLAN
+                       : ((meta.doPop == 8w1) ? hdr.vlan1.tpid : hdr.vlan0.tpid);
+        hdr.vlan0.pcp = (meta.doPush == 8w1) ? 3w0
+                       : ((meta.doPop == 8w1) ? hdr.vlan1.pcp : hdr.vlan0.pcp);
+        hdr.vlan0.dei = (meta.doPush == 8w1) ? 1w0
+                       : ((meta.doPop == 8w1) ? hdr.vlan1.dei : hdr.vlan0.dei);
+        hdr.vlan0.vid = (meta.doPush == 8w1) ? UPLINK_VID
+                       : ((meta.doPop == 8w1) ? hdr.vlan1.vid : hdr.vlan0.vid);
 
-        // 最外层的"下一层类型"指针：push ⇒ 指向 VLAN；pop ⇒ 指向被剥层的 nextType
-        hdr.ethernet.etherType = ((meta.fwdType == FWD_L3)
-                       ? ((hdr.otag.tpid == TPID_OTAG) ? hdr.ethernet.etherType : TPID_VLAN)
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0)
-                           ? ((hdr.otag.tpid == TPID_OTAG) ? hdr.ethernet.etherType : hdr.vlan0.nextType)
-                           : hdr.ethernet.etherType));
-        hdr.otag.nextType = ((meta.fwdType == FWD_L3)
-                       ? ((hdr.otag.tpid == TPID_OTAG) ? TPID_VLAN : hdr.otag.nextType)
-                       : ((meta.fwdType == FWD_L2 && meta.vlanDepth != 4w0)
-                           ? ((hdr.otag.tpid == TPID_OTAG) ? hdr.vlan0.nextType : hdr.otag.nextType)
-                           : hdr.otag.nextType));
+        // ⑤ 最外层指针（802.1Q 下即 eth.etherType，或 OpaqueTag 后的 nextType）：
+        //    push ⇒ 指向 VLAN；pop 后若还有层 ⇒ 仍指向 VLAN，剥光 ⇒ 指向链末端类型
+        hdr.ethernet.etherType = (meta.doPush == 8w1)
+                       ? ((meta.otagV == 8w1) ? hdr.ethernet.etherType : TPID_VLAN)
+                       : ((meta.doPop == 8w1)
+                           ? ((meta.otagV == 8w1) ? hdr.ethernet.etherType
+                              : ((meta.vlanDepth == 4w1) ? hdr.etype.value : TPID_VLAN))
+                           : hdr.ethernet.etherType);
+        hdr.otag.nextType = (meta.doPush == 8w1)
+                       ? ((meta.otagV == 8w1) ? TPID_VLAN : hdr.otag.nextType)
+                       : ((meta.doPop == 8w1)
+                           ? ((meta.otagV == 8w1)
+                              ? ((meta.vlanDepth == 4w1) ? hdr.etype.value : TPID_VLAN)
+                              : hdr.otag.nextType)
+                           : hdr.otag.nextType);
 
-        // ⑤ TTL 耗尽标记 —— ⚠️ 此处读到的 ttl 是**本 action 入口快照**（编辑前）
+        // ⑥ TTL 耗尽标记 —— ⚠️ 此处读到的 ttl 是**本 action 入口快照**（编辑前）
         meta.dropReason = (meta.rtHit == 8w1 && hdr.ipv4.ttl <= 8w1) ? DROP_TTL : DROP_NONE;
-        // ⑥ 每端口字节统计：fwdType/outPortIdx 是上一相位（resolve）写出的，可安全读取
+        // ⑦ 每端口字节统计：fwdType/outPortIdx 是上一相位（resolve）写出的，可安全读取
         portBytes.write(meta.outPortIdx[2:0],
             portBytes.read(meta.outPortIdx[2:0]) +
             ((meta.fwdType == FWD_L2 || meta.fwdType == FWD_L3)
@@ -459,8 +453,8 @@ control Ingress(inout headers_t hdr, inout metadata_t meta) {
         // p4c: lookup-group g0 = mac_table, route_table
         mac_table.apply();     // ┐ 同拍发 key
         route_table.apply();   // ┘ 同拍收 rsp 并应用 —— 查找延时 2 拍（串行需 4 拍）
-        resolve();             // 合并仲裁（决策字段）
-        rewrite();             // 报文编辑（含 VLAN 增删）+ 统计
+        resolve();             // 合并仲裁 + VLAN 增删决策（含层数边界）
+        rewrite();             // 报文编辑（含 VLAN 搬移）+ 统计
         ttl_guard.apply();     // TTL 守卫
     }
 }
@@ -476,6 +470,7 @@ control Deparser(packet_out pkt, in headers_t hdr) {
     pkt.emit(hdr.vlan1);
     pkt.emit(hdr.vlan2);
     pkt.emit(hdr.vlan3);
+    pkt.emit(hdr.etype);
     pkt.emit(hdr.ipv4);
     pkt.emit(hdr.udp);
     pkt.emit(hdr.tcp);

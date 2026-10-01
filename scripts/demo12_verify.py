@@ -104,29 +104,37 @@ def main() -> int:
 
     # ================= ① 预分类 =================
     c.case("classify：预分类 isL3（目的 MAC == 交换机 MAC），并清决策字段")
-    # v4 起 isL3 还要求"封装链末端指向 IPv4"：无标签时即 etherType == ET_IPV4
+    # v4 起 isL3 还要求"标签链末端指向 IPv4"——802.1Q 内部没有类型字段，
+    # 该语义由链末端的 `etype` 承载（真实帧里就是最后一个标签之后的那 2 字节）
     res = eval_ir(fn("action_classify"), {
-        "hdr.ethernet.dstAddr": SWITCH_MAC, "hdr.ethernet.etherType": 0x0800,
+        "hdr.ethernet.dstAddr": SWITCH_MAC, "hdr.etype.value": 0x0800,
         "hdr.ipv4.totalLen": 500})
     o = outs(res)
     c.eq("三层包（目的 MAC = 交换机 MAC）⇒ isL3 = 1", o.get("meta.isL3"), 1)
-    c.eq("isIpv4 = 1（无标签，etherType=0x0800）", o.get("meta.isIpv4"), 1)
+    c.eq("isIpv4 = 1（链末端 etype=0x0800）", o.get("meta.isIpv4"), 1)
     c.eq("ipLen = IPv4 totalLen", o.get("meta.ipLen"), 500)
     c.eq("清 macHit / rtHit", (o.get("meta.macHit"), o.get("meta.rtHit")), (0, 0))
     c.eq("dropReason = DROP_NONE", o.get("meta.dropReason"), 0)
-    # 非 IPv4（etherType 不是 0x0800）⇒ 即便目的 MAC 是交换机 MAC 也不上三层
+    # 非 IPv4（链末端不是 0x0800）⇒ 即便目的 MAC 是交换机 MAC 也不上三层
     res = eval_ir(fn("action_classify"), {
-        "hdr.ethernet.dstAddr": SWITCH_MAC, "hdr.ethernet.etherType": 0x0806})
+        "hdr.ethernet.dstAddr": SWITCH_MAC, "hdr.etype.value": 0x0806})
     c.eq("非 IPv4 包 ⇒ isL3 = 0", outs(res).get("meta.isL3"), 0)
-    # 带 VLAN 的封装链：末端 nextType 指向 IPv4 ⇒ isIpv4=1，内层 VID 被解析出来
+    # 带 VLAN 的封装链：层数由各槽位 tpid 判定，末端 etype 指向 IPv4
     res = eval_ir(fn("action_classify"), {
-        "hdr.ethernet.dstAddr": SWITCH_MAC, "hdr.ethernet.etherType": 0x8100,
-        "hdr.vlan0.tpid": 0x8100, "hdr.vlan0.nextType": 0x8100, "hdr.vlan0.vid": 20,
-        "hdr.vlan1.tpid": 0x8100, "hdr.vlan1.nextType": 0x0800, "hdr.vlan1.vid": 21})
+        "hdr.ethernet.dstAddr": SWITCH_MAC, "hdr.etype.value": 0x0800,
+        "hdr.vlan0.tpid": 0x8100, "hdr.vlan0.vid": 20,
+        "hdr.vlan1.tpid": 0x8100, "hdr.vlan1.vid": 21})
     o = outs(res)
     c.eq("双层 VLAN：vlanDepth = 2", o.get("meta.vlanDepth"), 2)
     c.eq("双层 VLAN：innerVid = 21（最内层）", o.get("meta.innerVid"), 21)
-    c.eq("双层 VLAN：isIpv4 = 1（vlan1.nextType=0x0800）", o.get("meta.isIpv4"), 1)
+    c.eq("双层 VLAN：isIpv4 = 1（链末端 etype=0x0800）", o.get("meta.isIpv4"), 1)
+    # OpaqueTag 存在性 + 0 层 VLAN（层数可选的另一边界）
+    res = eval_ir(fn("action_classify"), {
+        "hdr.otag.tpid": 0x8200, "hdr.vlan0.tpid": 0, "hdr.etype.value": 0x0800})
+    o = outs(res)
+    c.eq("OpaqueTag 存在 ⇒ otagV = 1", o.get("meta.otagV"), 1)
+    c.eq("0 层 VLAN ⇒ vlanDepth = 0", o.get("meta.vlanDepth"), 0)
+    c.eq("0 层 VLAN ⇒ innerVid = 0", o.get("meta.innerVid"), 0)
     res = eval_ir(fn("action_classify"), {"hdr.ethernet.dstAddr": 0x001122334455})
     c.eq("二层包 ⇒ isL3 = 0", outs(res).get("meta.isL3"), 0)
 

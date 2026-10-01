@@ -1091,7 +1091,13 @@ object ChiselBackend {
     val states = p.states.map(s => s.name -> s).toMap
     val layouts = mutable.HashMap.empty[String, StateLayout]
 
-    def headerSize(ht: HeaderType): Int = ht.fields.map(f => (f.width + 7) / 8).sum
+    /** header 在报文里占的字节数 = **header 总宽**向上取整到字节。
+      *
+      * ⚠️ 不能按字段逐个 ceil 再求和：802.1Q 的 `pcp(3)/dei(1)/vid(12)` 会被算成
+      * 1+1+2 = 4 字节 ⇒ 4 字节的 VLAN 标签变成 6 字节；同理 20 字节的 IPv4/TCP
+      * 会被算成 22 字节。真实以太网里 header 是**位紧凑**再整体对齐到字节的。 */
+    def headerSize(ht: HeaderType): Int =
+      (ht.fields.map(_.width).sum + 7) / 8
 
     def dfs(name: String, byteOffset: Int): Unit = {
       if (name == "accept" || name == "reject") return

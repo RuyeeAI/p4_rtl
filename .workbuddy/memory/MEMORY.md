@@ -198,9 +198,11 @@ XLS 线出 pkt_out 通道；Chisel 线告警跳过）、
 
 - **`// p4c: pkt-window N`**（顶层指示，全局唯一，≥112）：报文窗口此前写死 512 位；
   多层可选封装（VLAN/OpaqueTag）需要放大。→ `P4Program.pktWindowBits`，Xls/Chisel 共用。
-- ⚠️ **偏移口径**：header **起点**字节对齐（偏移 = 前序 header 的 `Σceil(字段宽/8)`），
-  但 header **内部**字段**位紧凑**、不逐字段补齐 ⇒ 组包/TB 按错口径写会整体错位
-  （`pcp(3)/dei(1)` 各占 1 字节，VLAN 槽 stride 是 64 不是 48）。
+- ⚠️ **偏移口径**（2026-10-02 修）：header 长度 = **header 总宽** ceil 到字节
+  （旧实现按字段逐 ceil 求和：4B 的 802.1Q 会被算成 6B、20B 的 IPv4/TCP 算成 22B）；
+  header **起点**字节对齐，header **内部**字段位紧凑 ⇒ 组包/TB 口径按错会整体错位。
+- ⚠️ **出包槽位宽 = 1 + header 宽**（valid 位在前）。parser 无条件 extract ⇒ **valid 恒 1**，
+  TB 期望值写成纯 header 宽会差一个最高位。
 - **可选封装（无 header stack/setValid）** ⇒ **固定槽位 + 存在标志**：每层占固定偏移
   槽位、自带 `tpid` + `nextType`；不存在填 0；增删 = 槽位内容搬移（正好用上
   「同一 action 读入口快照」语义）。代价：入包需归一化到最坏布局。

@@ -1,30 +1,34 @@
 `timescale 1ns/1ps
-// demo12（L2/L3 交换机 v4：可选 OpaqueTag + 最多 4 层 VLAN）真实 TB。
+// demo12（L2/L3 交换机 v4：可选 OpaqueTag + 0..4 层 **802.1Q VLAN**）真实 TB。
 //
-// 覆盖五类场景：① L2 转发 + 剥外层 VLAN（access） ② L3 路由 + 打外层 VLAN（trunk 上联）
-// ③ OpaqueTag + 双层 VLAN 的封装链解析（内层 VID 参与查表）④ TTL 耗尽 ⑤ 泛洪（不编辑）
+// 用例按**VLAN 层数**组织，覆盖"可选"的全部边界：
+//   ① 0 层 + L2  ⇒ 无可剥，报文不变        ⑤ 0 层 + L3  ⇒ 打 1 层（UPLINK_VID）
+//   ② 1 层 + L2  ⇒ 剥光，剩 0 层            ⑥ OpaqueTag + 1 层 + L2 ⇒ 剥光，otag 指向 payload
+//   ③ 2 层 + L2  ⇒ 剥外层，剩 1 层（内层顶上）⑦ 0 层 + L3(ttl=1) ⇒ ttl=0 且仍打 1 层
+//   ④ 4 层 + L3  ⇒ 满层饱和保护：不再加层    ⑧ 1 层 + 泛洪 ⇒ 不编辑
 //
 // 与骨架 TB 的区别：
-//  1. 两张 runtime 表外置，TB 充当表模块 mock：看到 key_vld 后按 latency 契约
-//     （mac 1-4 拍 / route 2-8 拍）延迟回 rsp 并保持一个窗口（valid_data 无背压：
-//     proc 会停在收 rsp 的相位等，早到会丢、晚到只是慢）；rsp 由用例设定（= 控制面表项）。
+//  1. 两张 runtime 表外置，TB 充当表模块 mock，且**按 key 应答**（否则命中与否与
+//     被测逻辑无关、测试永远绿）：看到 key_vld 后按 latency 契约（mac 1-4 拍 /
+//     route 2-8 拍）延迟回 rsp 并保持一个窗口（valid_data 无背压：早到会丢、
+//     晚到只是慢）。
 //  2. 期望值独立计算：校验和用 RFC 1624 增量公式在 TB 内算（不抄运行结果）。
 //  3. 统计断言与索引无关：只判「非零 32 位字个数 + 总和」，不猜 Register/Counter
 //     的元素排列顺序。
+//  4. 断言名用 ASCII：verilator 的 `%0s` 打印中文会产出非法 UTF-8（日志会被截坏）。
 //
 // ⚠️ 发包协议：pkt_in_vld 只挂**一拍**（parser 在相位 0 见 vld 即收包，
 //    挂着不放会让它在转完一圈回 ph0 时把同一包再收一遍 —— 曾踩过）。
 //
-// 位口径（pkt-window 800；偏移按**字段字节对齐**累加 —— 子集 M3 硬约束）：
-//   pkt_in  800 = eth112 | otag64 | vlan0..3 64×4 | ipv4 176(字段按字节补齐) | udp64 | 余量
-//   pkt_out 825 = eth113 | otag65 | vlan0..3 65×4 | ipv4 161 | udp65 | tcp161
-//   每个可选槽位自带 tpid + nextType（子集不变长解析 ⇒ 存在性靠 tpid 判定）
+// 位口径（pkt-window 640；header 起点字节对齐、内部字段位紧凑）：
+//   pkt_in  640 = eth112 | otag48 | vlan0..3 32×4 | etype16 | ipv4 160 | udp64 | 余量
+//   pkt_out 698 = eth113 | otag49 | vlan0..3 33×4 | etype17 | ipv4 161 | udp65 | tcp161
 module tb_demo12_l2l3_switch;
   reg clk = 0;
   always #5 clk = ~clk;
   reg rst = 1;
 
-  reg [799:0] pkt_in = 0;
+  reg [639:0] pkt_in = 0;
   reg         pkt_in_vld = 0;
   reg [5:0]   tbl_mac_table_rsp = 0;
   reg         tbl_mac_table_rsp_vld = 0;
@@ -36,11 +40,11 @@ module tb_demo12_l2l3_switch;
   wire         ex_portBytes_vld;
   wire [127:0] ex_fwdCnt;
   wire         ex_fwdCnt_vld;
-  wire [63:0]  tbl_mac_table_key;
+  wire [59:0]  tbl_mac_table_key;
   wire         tbl_mac_table_key_vld;
   wire [39:0]  tbl_route_table_key;
   wire         tbl_route_table_key_vld;
-  wire [824:0] pkt_out;
+  wire [697:0] pkt_out;
   wire         pkt_out_vld;
 
   Ingress_pipeline dut (
@@ -60,16 +64,13 @@ module tb_demo12_l2l3_switch;
   reg        mac_hit = 0;  reg [3:0] mac_port = 0;
   reg        rt_hit  = 0;  reg [3:0] rt_port = 0;
   reg [47:0] rt_nh   = 0;  reg [47:0] rt_src = 0;
-
-  // ⚠️ mock 必须**按 key 应答**：否则"命中与否"与被测逻辑（innerVid / isL3 的
-  //    计算）无关，TB 永远绿。这里只有 key 与用例预期的表项一致时才回 hit。
-  reg [63:0] exp_mac_key = 0;              // 用例下发的 mac 表项（目的 MAC + 内层 VID）
-  reg [39:0] exp_rt_key  = 0;              // 用例下发的路由表项（isL3 + 目的 IP）
+  reg [59:0] exp_mac_key = 0;   // 用例下发的 mac 表项：目的 MAC + 内层 VID
+  reg [39:0] exp_rt_key  = 0;   // 用例下发的路由表项：isL3 + 目的 IP
   wire       mac_eff = mac_hit && (cap_mac_key == exp_mac_key);
   wire       rt_eff  = rt_hit  && (cap_rt_key  == exp_rt_key);
 
   always @(*) begin
-    tbl_mac_table_rsp   = {mac_eff, ~mac_eff, mac_port};            // hit|actId|args(4)
+    tbl_mac_table_rsp   = {mac_eff, ~mac_eff, mac_port};             // hit|actId|args(4)
     tbl_route_table_rsp = {rt_eff, ~rt_eff, rt_port, rt_nh, rt_src}; // hit|actId|port|nh|src
   end
 
@@ -99,8 +100,9 @@ module tb_demo12_l2l3_switch;
   localparam [47:0] NH_MAC_3   = 48'h00de_adbe_ef01;
   localparam [31:0] DIP_3      = 32'h0a00_0003;
   localparam [15:0] IPLEN      = 16'd64;
-  localparam [15:0] UPLINK_VID = 16'd100;
-  localparam [63:0] NO_TAG     = 64'h0;
+  localparam [11:0] UPLINK_VID = 12'd100;
+  localparam [31:0] NO_VLAN    = 32'h0;
+  localparam [47:0] NO_OTAG    = 48'h0;
 
   function [15:0] rfc1624;                 // HC' = ~(~HC + ~m + m')，16 位回绕
     input [15:0] hc, m_old, m_new;
@@ -109,33 +111,29 @@ module tb_demo12_l2l3_switch;
     end
   endfunction
 
-  function [63:0] vlan_tag;                // 槽位：tpid | nextType | pcp | dei | vid
-    input [15:0] next_type; input [7:0] pcp, dei; input [15:0] vid;
+  function [31:0] vlan_tag;                // 802.1Q：TPID(16) + PCP(3) + DEI(1) + VID(12)
+    input [2:0] pcp; input dei; input [11:0] vid;
     begin
-      vlan_tag = {TPID_VLAN, next_type, pcp, dei, vid};
+      vlan_tag = {TPID_VLAN, pcp, dei, vid};
     end
   endfunction
 
-  function [63:0] otag_tag;                // 槽位：tpid | nextType | tagData
-    input [15:0] next_type; input [31:0] data;
+  function [47:0] otag_tag;                // OpaqueTag（自定义）：tpid + nextType + data
+    input [15:0] next_type; input [15:0] data;
     begin
       otag_tag = {TPID_OTAG, next_type, data};
     end
   endfunction
 
-  function [799:0] mk_pkt;                 // 固定槽位报文（不存在的槽位填 0）
+  function [639:0] mk_pkt;                 // 固定槽位报文（不存在的槽位填 0）
     input [47:0] dmac, smac; input [15:0] etype;
-    input [63:0] otag, v0, v1, v2, v3;
+    input [47:0] otag; input [31:0] v0, v1, v2, v3; input [15:0] etype_after;
     input [15:0] csum; input [7:0] ttl; input [31:0] sip, dip;
     begin
-      // 口径：header **起点**字节对齐（偏移 = 各 header 的 ceil 字节和），
-      //       header **内部**字段位紧凑（不逐字段补齐）⇒ IPv4 只有 160 位，
-      //       但下一个 header 要落在字节边界 ⇒ 这里补 16 位。
-      mk_pkt = {dmac, smac, etype, otag, v0, v1, v2, v3,
+      mk_pkt = {dmac, smac, etype, otag, v0, v1, v2, v3, etype_after,
                 4'h4, 4'h5, 8'h00, IPLEN, 16'h0000, 3'h0, 13'h0, ttl, 8'd17, csum, sip, dip,
-                16'h0,      // 补到字节边界（ipv4 占 22 字节）
                 64'h0,      // UDP 槽（protocol=17 ⇒ 解析）
-                128'h0};    // 窗口余量（TCP 槽与 UDP 同偏移，本例未解析）
+                112'h0};    // 窗口余量（TCP 槽与 UDP 同偏移，本例未解析）
     end
   endfunction
 
@@ -154,11 +152,11 @@ module tb_demo12_l2l3_switch;
   integer cyc;
 
   task chk;
-    input [8*32:1] name; input [63:0] got, want;
+    input [8*40:1] name; input [63:0] got, want;
     begin
       if (got === want) $display("  [ok] %0s = %h", name, got);
       else begin
-        $display("  [FAIL] %0s: 实际 %h，期望 %h", name, got, want);
+        $display("  [FAIL] %0s: got %h, want %h", name, got, want);
         errors = errors + 1;
       end
     end
@@ -174,14 +172,14 @@ module tb_demo12_l2l3_switch;
   endtask
 
   task send;
-    input [799:0] p;
+    input [639:0] p;
     begin
       @(negedge clk); pkt_in = p; pkt_in_vld = 1;
       @(negedge clk); pkt_in_vld = 0;   // 一拍撤 vld
       cyc = 0;
       while (cyc < 300 && !pkt_out_vld) begin @(negedge clk); cyc = cyc + 1; end
       if (!pkt_out_vld) begin
-        $display("  [FAIL] 等待 pkt_out_vld 超时");
+        $display("  [FAIL] wait pkt_out_vld timeout");
         errors = errors + 1;
       end
     end
@@ -189,16 +187,16 @@ module tb_demo12_l2l3_switch;
 
   reg [255:0] cap_portBytes = 0;
   reg [127:0] cap_fwdCnt = 0;
-  reg [63:0]  cap_mac_key = 0;
+  reg [59:0]  cap_mac_key = 0;
   reg [39:0]  cap_rt_key  = 0;
   always @(posedge clk) begin
     if (rst) begin
       cap_portBytes <= 0; cap_fwdCnt <= 0; cap_mac_key <= 0; cap_rt_key <= 0;
     end else begin
-      if (ex_portBytes_vld)       cap_portBytes <= ex_portBytes;
-      if (ex_fwdCnt_vld)          cap_fwdCnt    <= ex_fwdCnt;
-      if (tbl_mac_table_key_vld)  cap_mac_key   <= tbl_mac_table_key;
-      if (tbl_route_table_key_vld) cap_rt_key   <= tbl_route_table_key;
+      if (ex_portBytes_vld)        cap_portBytes <= ex_portBytes;
+      if (ex_fwdCnt_vld)           cap_fwdCnt    <= ex_fwdCnt;
+      if (tbl_mac_table_key_vld)   cap_mac_key   <= tbl_mac_table_key;
+      if (tbl_route_table_key_vld) cap_rt_key    <= tbl_route_table_key;
     end
   end
 
@@ -208,90 +206,126 @@ module tb_demo12_l2l3_switch;
     $dumpvars(1, tb_demo12_l2l3_switch);
     do_reset;
 
-    // ① L2 转发 + 剥外层 VLAN（用户口 access 出方向不带 VLAN）
-    $display("■ ① L2 转发（mac 命中 port1）+ 剥外层 VLAN");
-    mac_hit = 1; mac_port = 4'd1; rt_hit = 0; exp_mac_key = {OLD_DST, 16'd10}; exp_rt_key = 0;
-    send(mk_pkt(.dmac(OLD_DST), .smac(OLD_SRC), .etype(TPID_VLAN), .otag(NO_TAG),
-                .v0(vlan_tag(.next_type(ET_IPV4), .pcp(8'h0), .dei(8'h0), .vid(16'd10))),
-                .v1(NO_TAG), .v2(NO_TAG), .v3(NO_TAG),
+    // ① 0 层 VLAN + L2 命中 ⇒ 无可剥（doPop=0），报文原样
+    $display("[case 1] 0 VLAN + L2 hit  => nothing to pop");
+    mac_hit = 1; mac_port = 4'd1; rt_hit = 0;
+    exp_mac_key = {OLD_DST, 12'd0}; exp_rt_key = 0;
+    send(mk_pkt(.dmac(OLD_DST), .smac(OLD_SRC), .etype(ET_IPV4), .otag(NO_OTAG),
+                .v0(NO_VLAN), .v1(NO_VLAN), .v2(NO_VLAN), .v3(NO_VLAN),
+                .etype_after(ET_IPV4),
                 .csum(16'h1234), .ttl(8'd64), .sip(32'h0a000001), .dip(32'h0a000002)));
-    chk("mac-key(dst+innerVid)", cap_mac_key, {OLD_DST, 16'd10});
-    chk("rt-key isL3=0 (L2 pkt)", cap_rt_key[39:32], 8'h00);
-    chk("ipv4_v",   pkt_out[386],     1'h1);
-    chk("dstMac",   pkt_out[823:776], OLD_DST);
-    chk("ethType",  pkt_out[727:712], ET_IPV4);       // 剥 VLAN 后指回 IPv4
-    chk("vlan0 popped (tpid=0)", pkt_out[645:630], 16'h0);
-    chk("ttl",      pkt_out[321:314], 8'd64);         // 二层不改 TTL
-    chk("hdrCsum",  pkt_out[305:290], 16'h1234);
-    chk("portBytes nonzero words", nz256(cap_portBytes), 4'd1);
-    chk("portBytes sum",     sum256(cap_portBytes), IPLEN);
-    chk("fwdCnt nonzero words",    nz128(cap_fwdCnt), 4'd1);   // L2 计数 +1
+    chk("mac-key(dst+innerVid)", cap_mac_key, {OLD_DST, 12'd0});
+    chk("ethType unchanged",     pkt_out[600:585], ET_IPV4);
+    chk("vlan0 empty",           pkt_out[534:519], 16'h0);
+    chk("ttl",                   pkt_out[321:314], 8'd64);
+    chk("portBytes sum",         sum256(cap_portBytes), IPLEN);
+    chk("fwdCnt nonzero words",  nz128(cap_fwdCnt), 4'd1);
 
-    // ② L3 路由 + 打外层 VLAN（上联口 trunk 出方向带 UPLINK_VID）
-    $display("■ ② L3 路由（route 命中 port0）+ 打外层 VLAN");
+    // ② 1 层 VLAN + L2 命中 ⇒ 剥一层 ⇒ 出包 0 层，eth.etherType 回到链末端类型
+    $display("[case 2] 1 VLAN + L2 hit  => pop to 0");
+    do_reset;
+    mac_hit = 1; mac_port = 4'd1; rt_hit = 0;
+    exp_mac_key = {OLD_DST, 12'd10}; exp_rt_key = 0;
+    send(mk_pkt(.dmac(OLD_DST), .smac(OLD_SRC), .etype(TPID_VLAN), .otag(NO_OTAG),
+                .v0(vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(12'd10))),
+                .v1(NO_VLAN), .v2(NO_VLAN), .v3(NO_VLAN), .etype_after(ET_IPV4),
+                .csum(16'h1234), .ttl(8'd64), .sip(32'h0a000001), .dip(32'h0a000002)));
+    chk("mac-key innerVid=10",   cap_mac_key, {OLD_DST, 12'd10});
+    chk("ethType -> payload",    pkt_out[600:585], ET_IPV4);
+    chk("vlan0 cleared",         pkt_out[535:503], {1'b1, 32'h0});
+    chk("ttl",                   pkt_out[321:314], 8'd64);
+
+    // ③ 2 层 VLAN + L2 命中 ⇒ 剥外层，内层顶上（vid 20 被剥，剩 21）
+    $display("[case 3] 2 VLAN + L2 hit  => pop outer, inner up");
+    do_reset;
+    mac_hit = 1; mac_port = 4'd2; rt_hit = 0;
+    exp_mac_key = {OLD_DST, 12'd21}; exp_rt_key = 0;
+    send(mk_pkt(.dmac(OLD_DST), .smac(OLD_SRC), .etype(TPID_VLAN), .otag(NO_OTAG),
+                .v0(vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(12'd20))),
+                .v1(vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(12'd21))),
+                .v2(NO_VLAN), .v3(NO_VLAN), .etype_after(ET_IPV4),
+                .csum(16'h1234), .ttl(8'd64), .sip(32'h0a000001), .dip(32'h0a000002)));
+    chk("mac-key innerVid=21",   cap_mac_key, {OLD_DST, 12'd21});
+    chk("ethType still VLAN",    pkt_out[600:585], TPID_VLAN);
+    chk("vlan0 = old vlan1",     pkt_out[535:503], {1'b1, vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(12'd21))});
+    chk("vlan1 cleared",         pkt_out[502:470], {1'b1, 32'h0});
+
+    // ④ 4 层 VLAN（满配）+ L3 命中 ⇒ 饱和保护：不再加层
+    $display("[case 4] 4 VLAN + L3 hit  => saturation, no push");
     do_reset;
     mac_hit = 0; rt_hit = 1; rt_port = 4'd0; rt_nh = NH_MAC_3; rt_src = SWITCH_MAC;
     exp_rt_key = {8'h01, DIP_3}; exp_mac_key = 0;
-    send(mk_pkt(.dmac(SWITCH_MAC), .smac(OLD_SRC), .etype(ET_IPV4),
-                .otag(NO_TAG), .v0(NO_TAG), .v1(NO_TAG), .v2(NO_TAG), .v3(NO_TAG),
+    send(mk_pkt(.dmac(SWITCH_MAC), .smac(OLD_SRC), .etype(TPID_VLAN), .otag(NO_OTAG),
+                .v0(vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(12'd1))),
+                .v1(vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(12'd2))),
+                .v2(vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(12'd3))),
+                .v3(vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(12'd4))),
+                .etype_after(ET_IPV4),
                 .csum(16'h1234), .ttl(8'd64), .sip(32'h0a000001), .dip(DIP_3)));
-    chk("rt-key(isL3=1+dip)", cap_rt_key, {8'h01, DIP_3});
-    chk("ethType",    pkt_out[727:712], TPID_VLAN);
-    chk("vlan0 tpid", pkt_out[645:630], TPID_VLAN);
-    chk("vlan0 next", pkt_out[629:614], ET_IPV4);
-    chk("vlan0 vid",  pkt_out[597:582], UPLINK_VID);
-    chk("dstMac",     pkt_out[823:776], NH_MAC_3);
-    chk("srcMac",     pkt_out[775:728], SWITCH_MAC);
-    chk("ttl",        pkt_out[321:314], 8'd63);
-    chk("hdrCsum",    pkt_out[305:290], rfc1624(16'h1234, 16'd64, 16'd63));
-    chk("fwdCnt nonzero words", nz128(cap_fwdCnt), 4'd1);   // L3 计数 +1
+    chk("rt-key(isL3=1+dip)",    cap_rt_key, {8'h01, DIP_3});
+    chk("vlan0 kept vid=1",      pkt_out[535:503], {1'b1, vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(12'd1))});
+    chk("vlan3 kept vid=4",      pkt_out[436:404], {1'b1, vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(12'd4))});
+    chk("dstMac rewritten",      pkt_out[696:649], NH_MAC_3);
+    chk("ttl-1",                 pkt_out[321:314], 8'd63);
+    chk("hdrCsum(rfc1624)",      pkt_out[305:290], rfc1624(16'h1234, 16'd64, 16'd63));
 
-    // ③ OpaqueTag + 双层 VLAN：封装链解析（otag→vlan0→vlan1），内层 VID 参与查表
-    $display("■ ③ OpaqueTag + 双层 VLAN（内层 VID 查表 + 剥外层）");
-    do_reset;
-    mac_hit = 1; mac_port = 4'd2; rt_hit = 0; exp_mac_key = {OLD_DST, 16'd21}; exp_rt_key = 0;
-    send(mk_pkt(.dmac(OLD_DST), .smac(OLD_SRC), .etype(TPID_OTAG),
-                .otag(otag_tag(.next_type(TPID_VLAN), .data(32'habcd_ef01))),
-                .v0(vlan_tag(.next_type(TPID_VLAN), .pcp(8'h0), .dei(8'h0), .vid(16'd20))),
-                .v1(vlan_tag(.next_type(ET_IPV4),   .pcp(8'h0), .dei(8'h0), .vid(16'd21))),
-                .v2(NO_TAG), .v3(NO_TAG),
-                .csum(16'h1234), .ttl(8'd64), .sip(32'h0a000001), .dip(32'h0a000002)));
-    chk("mac-key(dst+innerVid)", cap_mac_key, {OLD_DST, 16'd21});
-    chk("otag tpid",  pkt_out[710:695], TPID_OTAG);
-    chk("otag next",  pkt_out[694:679], TPID_VLAN);    // 剥层后仍指向 VLAN
-    chk("vlan0 tpid", pkt_out[645:630], TPID_VLAN);
-    chk("vlan0 next", pkt_out[629:614], ET_IPV4);      // 原 vlan1 顶上
-    chk("vlan0 vid",  pkt_out[597:582], 16'd21);
-    chk("vlan1 cleared", pkt_out[580:565], 16'h0);
-    chk("ethType unchanged (otag)", pkt_out[727:712], TPID_OTAG);
-    chk("ttl",        pkt_out[321:314], 8'd64);
-
-    // ④ TTL 耗尽：L3 命中 + ttl=1 ⇒ ttl=0、ttl_guard 丢弃（L3 与 DROP 各计一次）
-    $display("■ ④ TTL 耗尽（L3 命中 ttl=1 ⇒ ttl=0 + drop，仍打外层 VLAN）");
+    // ⑤ 0 层 VLAN + L3 命中 ⇒ 打 1 层外层 VLAN（trunk 上联）
+    $display("[case 5] 0 VLAN + L3 hit  => push 1 (UPLINK_VID)");
     do_reset;
     mac_hit = 0; rt_hit = 1; rt_port = 4'd0; rt_nh = NH_MAC_3; rt_src = SWITCH_MAC;
     exp_rt_key = {8'h01, DIP_3}; exp_mac_key = 0;
-    send(mk_pkt(.dmac(SWITCH_MAC), .smac(OLD_SRC), .etype(ET_IPV4),
-                .otag(NO_TAG), .v0(NO_TAG), .v1(NO_TAG), .v2(NO_TAG), .v3(NO_TAG),
-                .csum(16'h5678), .ttl(8'd1), .sip(32'h0a000001), .dip(DIP_3)));
-    chk("ttl",        pkt_out[321:314], 8'd0);
-    chk("hdrCsum",    pkt_out[305:290], rfc1624(16'h5678, 16'd1, 16'd0));
-    chk("vlan0 vid",  pkt_out[597:582], UPLINK_VID);   // 编辑发生在 ttl_guard 之前
-    chk("fwdCnt nonzero words", nz128(cap_fwdCnt), 4'd2);   // L3 + DROP
+    send(mk_pkt(.dmac(SWITCH_MAC), .smac(OLD_SRC), .etype(ET_IPV4), .otag(NO_OTAG),
+                .v0(NO_VLAN), .v1(NO_VLAN), .v2(NO_VLAN), .v3(NO_VLAN),
+                .etype_after(ET_IPV4),
+                .csum(16'h1234), .ttl(8'd64), .sip(32'h0a000001), .dip(DIP_3)));
+    chk("ethType -> VLAN",       pkt_out[600:585], TPID_VLAN);
+    chk("vlan0 pushed",          pkt_out[535:503], {1'b1, vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(UPLINK_VID))});
+    chk("etype field kept",      pkt_out[402:387], ET_IPV4);
+    chk("dstMac",                pkt_out[696:649], NH_MAC_3);
+    chk("ttl-1",                 pkt_out[321:314], 8'd63);
 
-    // ⑤ 泛洪：两表都不命中 ⇒ 不编辑（既不打也不剥 VLAN）
-    $display("■ ⑤ 泛洪（两表均未命中 ⇒ 报文原样）");
+    // ⑥ OpaqueTag + 1 层 VLAN + L2 ⇒ 剥光后 otag.nextType 指回 payload
+    $display("[case 6] OpaqueTag + 1 VLAN + L2 => pop, otag -> payload");
+    do_reset;
+    mac_hit = 1; mac_port = 4'd3; rt_hit = 0;
+    exp_mac_key = {OLD_DST, 12'd30}; exp_rt_key = 0;
+    send(mk_pkt(.dmac(OLD_DST), .smac(OLD_SRC), .etype(TPID_OTAG),
+                .otag(otag_tag(.next_type(TPID_VLAN), .data(16'habcd))),
+                .v0(vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(12'd30))),
+                .v1(NO_VLAN), .v2(NO_VLAN), .v3(NO_VLAN), .etype_after(ET_IPV4),
+                .csum(16'h1234), .ttl(8'd64), .sip(32'h0a000001), .dip(32'h0a000002)));
+    chk("mac-key innerVid=30",   cap_mac_key, {OLD_DST, 12'd30});
+    chk("ethType still OTAG",    pkt_out[600:585], TPID_OTAG);
+    chk("otag next -> payload",  pkt_out[567:552], ET_IPV4);
+    chk("vlan0 cleared",         pkt_out[535:503], {1'b1, 32'h0});
+
+    // ⑦ TTL 耗尽（0 层 + L3，ttl=1）⇒ ttl=0 + 仍打 1 层（编辑在 ttl_guard 之前）
+    $display("[case 7] TTL exhaust (L3 ttl=1) => ttl=0 + push");
+    do_reset;
+    mac_hit = 0; rt_hit = 1; rt_port = 4'd0; rt_nh = NH_MAC_3; rt_src = SWITCH_MAC;
+    exp_rt_key = {8'h01, DIP_3}; exp_mac_key = 0;
+    send(mk_pkt(.dmac(SWITCH_MAC), .smac(OLD_SRC), .etype(ET_IPV4), .otag(NO_OTAG),
+                .v0(NO_VLAN), .v1(NO_VLAN), .v2(NO_VLAN), .v3(NO_VLAN),
+                .etype_after(ET_IPV4),
+                .csum(16'h5678), .ttl(8'd1), .sip(32'h0a000001), .dip(DIP_3)));
+    chk("ttl=0",                 pkt_out[321:314], 8'd0);
+    chk("hdrCsum(rfc1624)",      pkt_out[305:290], rfc1624(16'h5678, 16'd1, 16'd0));
+    chk("vlan0 pushed anyway",   pkt_out[535:503], {1'b1, vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(UPLINK_VID))});
+    chk("fwdCnt nonzero words",  nz128(cap_fwdCnt), 4'd2);   // L3 + DROP
+
+    // ⑧ 泛洪（1 层 VLAN）⇒ 不编辑，层数与 VID 原样
+    $display("[case 8] flood (1 VLAN) => no edit");
     do_reset;
     mac_hit = 0; rt_hit = 0; exp_mac_key = 0; exp_rt_key = 0;
-    send(mk_pkt(.dmac(OLD_DST), .smac(OLD_SRC), .etype(TPID_VLAN), .otag(NO_TAG),
-                .v0(vlan_tag(.next_type(ET_IPV4), .pcp(8'h0), .dei(8'h0), .vid(16'd30))),
-                .v1(NO_TAG), .v2(NO_TAG), .v3(NO_TAG),
+    send(mk_pkt(.dmac(OLD_DST), .smac(OLD_SRC), .etype(TPID_VLAN), .otag(NO_OTAG),
+                .v0(vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(12'd40))),
+                .v1(NO_VLAN), .v2(NO_VLAN), .v3(NO_VLAN), .etype_after(ET_IPV4),
                 .csum(16'h1234), .ttl(8'd64), .sip(32'h0a000001), .dip(32'h0a000002)));
-    chk("ethType",    pkt_out[727:712], TPID_VLAN);
-    chk("vlan0 vid",  pkt_out[597:582], 16'd30);       // 原样保留
-    chk("ttl",        pkt_out[321:314], 8'd64);
-    chk("portBytes sum", sum256(cap_portBytes), 64'd0);
-    chk("fwdCnt nonzero words", nz128(cap_fwdCnt), 4'd0);
+    chk("ethType unchanged",     pkt_out[600:585], TPID_VLAN);
+    chk("vlan0 kept vid=40",     pkt_out[535:503], {1'b1, vlan_tag(.pcp(3'h0), .dei(1'h0), .vid(12'd40))});
+    chk("ttl",                   pkt_out[321:314], 8'd64);
+    chk("portBytes sum",         sum256(cap_portBytes), 64'd0);
+    chk("fwdCnt nonzero words",  nz128(cap_fwdCnt), 4'd0);
 
     repeat (3) @(posedge clk);
     if (errors == 0) $display(" 结果：全部通过");
@@ -301,7 +335,7 @@ module tb_demo12_l2l3_switch;
 
   initial begin
     #200000;
-    $display("[FAIL] 仿真超时");
+    $display("[FAIL] simulation timeout");
     $finish;
   end
 endmodule
