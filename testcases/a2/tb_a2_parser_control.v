@@ -82,14 +82,26 @@ module tb_a2_parser_control;
 
   // ------------------------------------------------------------------
   // 发一包并检查 phv_out
-  //   send_pkt **不自己等时钟**：调用点就是「该更新 pkt_in 的时刻」。
-  //   连续发包时这一点很关键 —— proc 在相位 4 拉高 phv_out_vld，下一个 posedge
-  //   相位才变 0 并采样 pkt_in，所以必须在**看到 vld 的那个 negedge** 就换数据。
+  //   协议（跨仿真器确定性，iverilog/verilator 均可）：
+  //   ① proc 停在相位 0 等包；send_pkt 在 negedge 置数并拉高 vld，
+  //      **下一拍 negedge 立刻撤 vld** —— 一个 vld 脉冲只覆盖一个 posedge，
+  //      proc 必收且只收一次（若 vld 一直挂着，proc 转完一圈回 ph0 会把
+  //      同一个包再收一遍，产生一条陈旧结果脉冲，TB 就会采错包）。
+  //   ② check 等本轮 phv_out_vld 上升后采样；采样后 proc 早已回到 ph0，
+  //      补两拍停等再发下一包即可（不复位，验证状态跨包不残留）。
   // ------------------------------------------------------------------
   task send_pkt(input [15:0] etype);
     begin
       pkt_in = {DST, SRC, etype, IPV4, 240'h0};
       pkt_in_vld = 1;
+    end
+  endtask
+
+  // 发包 + 一拍撤 vld（收包脉冲化）
+  task send_one(input [15:0] etype);
+    begin
+      send_pkt(etype);
+      @(negedge clk); pkt_in_vld = 0;
     end
   endtask
 
@@ -135,33 +147,33 @@ module tb_a2_parser_control;
     @(negedge clk); rst = 0;
 
     // case 1：0x0800 → 解析 ipv4 + 表命中 0x0800（set_cls(7)）
-    @(negedge clk); send_pkt(ETYPE_IPV4);
+    send_one(ETYPE_IPV4);
     check({1'b1, DST, SRC, ETYPE_IPV4, 1'b1, IPV4, 16'h0000, 8'h07},
           1, "0x0800: parse_ipv4 + set_cls(7)");
-    pkt_in_vld = 0; repeat (2) @(posedge clk);
+    repeat (2) @(negedge clk);   // 等 proc 回 ph0 停稳
 
     // case 2：0x86dd → default(accept)，不解析 ipv4；表命中 0x86dd（set_cls(9)）
-    @(negedge clk); send_pkt(ETYPE_IPV6);
+    send_one(ETYPE_IPV6);
     check({1'b1, DST, SRC, ETYPE_IPV6, 1'b0, 160'h0, 16'h0000, 8'h09},
           2, "0x86dd: accept + set_cls(9)");
-    pkt_in_vld = 0; repeat (2) @(posedge clk);
+    repeat (2) @(negedge clk);
 
     // case 3：0x1234 → accept + 表不命中 → default(nop)，meta 保持清零值
-    @(negedge clk); send_pkt(ETYPE_OTHER);
+    send_one(ETYPE_OTHER);
     check({1'b1, DST, SRC, ETYPE_OTHER, 1'b0, 160'h0, 16'h0000, 8'h00},
           3, "0x1234: accept + nop, meta stays 0");
-    pkt_in_vld = 0; repeat (2) @(posedge clk);
+    repeat (2) @(negedge clk);
 
     // case 4/5：连发两包（不复位）—— 第 1 包解析 ipv4，第 2 包走 default，
     //           ipv4 valid 必须回到 0（验证 phase 0 的清零，无跨包残留）
     $display("---- case 4/5：连发两包（0x0800 后接 0x86dd，不复位）----");
-    @(negedge clk); send_pkt(ETYPE_IPV4);
+    send_one(ETYPE_IPV4);
     check({1'b1, DST, SRC, ETYPE_IPV4, 1'b1, IPV4, 16'h0000, 8'h07},
           4, "pkt1 0x0800");
-    send_pkt(ETYPE_IPV6);   // 就在 check 停下的那个 negedge 换包，vld 保持 1
+    repeat (2) @(negedge clk);
+    send_one(ETYPE_IPV6);
     check({1'b1, DST, SRC, ETYPE_IPV6, 1'b0, 160'h0, 16'h0000, 8'h09},
           5, "pkt2 0x86dd, ipv4_v must be 0");
-    pkt_in_vld = 0;
 
     $display("============================================================");
     if (errors == 0) $display(" 结果：全部通过");

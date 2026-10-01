@@ -18,11 +18,11 @@ import scala.sys.process._
 //     │    ② IR 文本 dump/parse 往返保语义
 //     ├─ Verilog 生成（XLS codegen driver）
 //     ├─ Chisel BlackBox 生成（内嵌 py）
-//     ├─ 仿真模型：RTL + testbench（自带优先 / 否则生成骨架）+ iverilog/vvp 跑通
+//     ├─ 仿真模型：RTL + testbench（自带优先 / 否则生成骨架）+ verilator 跑通（iverilog 回退）
 //     └─ 资源报告：IR 规模（state 位宽/节点/算子直方图/II）+ RTL 规模（寄存器/线网/端口）
 //
 // 设计口径
-//   - 外部依赖（XLS harness 二进制、iverilog、z3）**显式探测**：缺了记 SKIP 并在报告里说明，
+//   - 外部依赖（XLS harness 二进制、verilator、z3）**显式探测**：缺了记 SKIP 并在报告里说明，
 //     不静默降级（"跑过了"和"没跑"必须一眼可分）。
 //   - 所有产物落 <out>/ 下按类型分目录，报告同时出 Markdown（给人看）与 JSON（给脚本）。
 // ===========================================================================
@@ -197,10 +197,13 @@ object Flow {
   // ------------------------------------------------------------------
   final case class VPort(name: String, width: Int, dir: String, vld: Boolean)
 
-  def portsOf(verilog: String): (String, Seq[VPort]) = {
+  def portsOf(verilog: String, top: String = null): (String, Seq[VPort]) = {
     val lines = verilog.linesIterator.toVector
-    val i0 = lines.indexWhere(_.trim.startsWith("module "))
-    if (i0 < 0) return ("", Seq.empty)
+    // top 指定 ⇒ 在多模块文件（proc 网络）里选 `module <top>(` 的那个；否则取第一个
+    val i0 = if (top != null)
+      lines.indexWhere(l => l.trim.startsWith("module ") && l.trim.stripPrefix("module ").takeWhile(_ != '(').trim == top)
+    else lines.indexWhere(_.trim.startsWith("module "))
+    if (i0 < 0) return (if (top != null) top else "", Seq.empty)
     val mod = lines(i0).trim.stripPrefix("module ").takeWhile(_ != '(').trim
     val buf = mutable.ArrayBuffer.empty[VPort]
     var i = i0
@@ -505,7 +508,7 @@ object Flow {
     }
   }
 
-  // ---- 步骤 9：仿真模型（TB + iverilog + vvp） ----
+  // ---- 步骤 9：仿真模型（TB + verilator 主 / iverilog 回退） ----
   private def stepSim(ctx: Ctx): Unit = {
     val t = System.nanoTime()
     ctx.verilog match {
@@ -515,7 +518,8 @@ object Flow {
         val simV = ctx.dirSim.resolve(ctx.cfg.stem + ".v")
         Files.copy(v, simV, StandardCopyOption.REPLACE_EXISTING)
         val text = new String(Files.readAllBytes(v), StandardCharsets.UTF_8)
-        val (mod, ports) = portsOf(text)
+        // ⚠️ 多 proc 网络的 .v 含全部子模块 —— TB 例化 / --top-module 必须用**顶层**
+        val (mod, ports) = portsOf(text, ctx.topName)
 
         // TB：命令行指定 > 已知样本 > testcases/a2 命名扫描 > 自动生成骨架
         val explicit = ctx.cfg.tb
@@ -528,36 +532,114 @@ object Flow {
         if (tbIsSkeleton) Files.write(tbFile, tbSkeleton(mod, ports, ctx.cfg.stem).getBytes(StandardCharsets.UTF_8))
         else Files.copy(tbSrc.get, tbFile, StandardCopyOption.REPLACE_EXISTING)
 
-        val runScript = ctx.dirSim.resolve("run.sh")
-        Files.write(runScript, s"""#!/usr/bin/env bash
+        // 引擎选择：**verilator 主**（本机 iverilog 已移除；verilator 5 的
+        // --binary --timing 直接编译 Verilog TB + DUT 成可执行），iverilog 回退。
+        val hasVl = Tool.which("verilator").isDefined
+        val hasIv = Tool.which("iverilog").isDefined && Tool.which("vvp").isDefined
+        if (!hasVl && !hasIv) {
+          ctx.add(Step("sim", "仿真模型（RTL + TB）", Status.Skip,
+            "缺 verilator/iverilog，只产出模型未运行", ms(t), ""))
+          return
+        }
+
+        // 运行仿真二进制并按 [ok]/[FAIL] 计数判定
+        def runAndJudge(rc2: Int, log2: String, engine: String): Unit = {
+          ctx.simLog = log2
+          val okN = log2.linesIterator.count(_.contains("[ok]"))
+          val failN = log2.linesIterator.count(_.contains("[FAIL]"))
+          val verdict = log2.linesIterator.find(l => l.contains("结果：")).map(_.trim).getOrElse("")
+          val st = if (rc2 != 0 || failN > 0) Status.Fail else if (tbIsSkeleton) Status.Warn else Status.Ok
+          ctx.add(Step("sim", if (tbIsSkeleton) s"仿真模型（$engine，骨架未自检）" else s"仿真模型（$engine）", st,
+            (if (tbIsSkeleton) "自动生成 TB 骨架，激励待补" else s"用例 ok=$okN fail=$failN") +
+              (if (verdict.nonEmpty) s" · $verdict" else ""),
+            ms(t), tail(log2, 8)))
+        }
+
+        if (hasVl) {
+          val objDir = ctx.dirSim.resolve("obj_dir")
+          val binName = s"sim_${ctx.cfg.stem}"
+          // ⚠️ verilator 的 top 是**TB**（含时钟/激励、例化 DUT 的那个 module）——
+          // 传 DUT 名会把 TB 剔出例化树，仿真 0 时刻就结束（实测踩过）。
+          // TB 顶层按约定取 `tb_` 前缀的 module（骨架与已知样本都遵守）；否则取第一个。
+          val tbMod = """(?m)^\s*module\s+([A-Za-z_][A-Za-z0-9_]*)""".r
+            .findAllMatchIn(new String(Files.readAllBytes(tbFile), StandardCharsets.UTF_8))
+            .map(_.group(1)).toList
+          val simTop = tbMod.find(_.startsWith("tb_")).orElse(tbMod.headOption).getOrElse("tb")
+          // proc 网络的 .v 引用 xls_fifo_wrapper（codegen 对 FIFO 通道只发实例不发定义）——
+          // 自动带上 XLS 的模块源一起编译
+          val extraSrc: Seq[Path] =
+            if (text.contains("xls_fifo_wrapper")) fifoWrapperSource(ctx, ctx.dirSim) match {
+              case Some(f) => Seq(f)
+              case None =>
+                ctx.add(Step("sim", "仿真模型（verilator 编译）", Status.Fail,
+                  "Verilog 含 xls_fifo_wrapper 实例但找不到模块源（third_party/xls 与 jar 资源均无）", ms(t), ""))
+                return
+            }
+            else Seq.empty
+          val srcs = (Seq(simV, tbFile) ++ extraSrc).map(_.toString)
+          val runScript = ctx.dirSim.resolve("run.sh")
+          Files.write(runScript, s"""#!/usr/bin/env bash
+# 一键跑这个仿真模型（由 p4flow 生成；引擎 verilator --binary --timing）
+set -euo pipefail
+cd "$$(dirname "$$0")"
+verilator --binary --timing --top-module $simTop -Wno-fatal \\
+  --Mdir obj_dir -o $binName ${srcs.map(p => new java.io.File(p).getName).mkString(" ")}
+./obj_dir/$binName
+""".getBytes(StandardCharsets.UTF_8))
+          // 编译（含 C++ 模型构建，首次较慢 → 单独长超时）
+          val (rc1, log1) = sh(Seq("verilator", "--binary", "--timing", "--top-module", simTop,
+            "-Wno-fatal", "--Mdir", objDir.toString, "-o", binName) ++ srcs, ctx.cfg.repoRoot, 600)
+          if (rc1 != 0) {
+            ctx.add(Step("sim", "仿真模型（verilator 编译）", Status.Fail, s"verilator 退出码 $rc1", ms(t), tail(log1, 12)))
+            return
+          }
+          val simBin = objDir.resolve(binName)
+          val (rc2, log2) = sh(Seq(simBin.toString), ctx.cfg.repoRoot, ctx.cfg.simTimeoutSec)
+          runAndJudge(rc2, log2, "verilator")
+        } else {
+          val runScript = ctx.dirSim.resolve("run.sh")
+          // proc 网络的 .v 引用 xls_fifo_wrapper —— 同样补上模块源（iverilog 回退路径）
+          val extraSrc: Seq[Path] =
+            if (text.contains("xls_fifo_wrapper")) fifoWrapperSource(ctx, ctx.dirSim) match {
+              case Some(f) => Seq(f)
+              case None =>
+                ctx.add(Step("sim", "仿真模型（编译）", Status.Fail,
+                  "Verilog 含 xls_fifo_wrapper 实例但找不到模块源", ms(t), ""))
+                return
+            }
+            else Seq.empty
+          val srcs = (Seq(simV, tbFile) ++ extraSrc).map(_.toString)
+          Files.write(runScript, s"""#!/usr/bin/env bash
 # 一键跑这个仿真模型（由 p4flow 生成）
 set -euo pipefail
 cd "$$(dirname "$$0")"
-iverilog -g2012 -o tb_${ctx.cfg.stem}.vvp ${simV.getFileName} tb_${ctx.cfg.stem}.v
+iverilog -g2012 -o tb_${ctx.cfg.stem}.vvp ${srcs.map(p => new java.io.File(p).getName).mkString(" ")}
 vvp tb_${ctx.cfg.stem}.vvp
 """.getBytes(StandardCharsets.UTF_8))
-
-        if (Tool.which("iverilog").isEmpty || Tool.which("vvp").isEmpty) {
-          ctx.add(Step("sim", "仿真模型（RTL + TB + run.sh）", Status.Skip,
-            "缺 iverilog/vvp，只产出模型未运行", ms(t), ""))
-          return
+          val vvp = ctx.dirSim.resolve(s"tb_${ctx.cfg.stem}.vvp")
+          val (rc1, log1) = sh(Seq("iverilog", "-g2012", "-o", vvp.toString) ++ srcs, ctx.cfg.repoRoot)
+          if (rc1 != 0) {
+            ctx.add(Step("sim", "仿真模型（编译）", Status.Fail, s"iverilog 退出码 $rc1", ms(t), tail(log1, 12)))
+            return
+          }
+          val (rc2, log2) = sh(Seq("vvp", vvp.toString), ctx.cfg.repoRoot, ctx.cfg.simTimeoutSec)
+          runAndJudge(rc2, log2, "iverilog")
         }
-        val vvp = ctx.dirSim.resolve(s"tb_${ctx.cfg.stem}.vvp")
-        val (rc1, log1) = sh(Seq("iverilog", "-g2012", "-o", vvp.toString, simV.toString, tbFile.toString), ctx.cfg.repoRoot)
-        if (rc1 != 0) {
-          ctx.add(Step("sim", "仿真模型（编译）", Status.Fail, s"iverilog 退出码 $rc1", ms(t), tail(log1, 12)))
-          return
-        }
-        val (rc2, log2) = sh(Seq("vvp", vvp.toString), ctx.cfg.repoRoot, ctx.cfg.simTimeoutSec)
-        ctx.simLog = log2
-        val okN = log2.linesIterator.count(_.contains("[ok]"))
-        val failN = log2.linesIterator.count(_.contains("[FAIL]"))
-        val verdict = log2.linesIterator.find(l => l.contains("结果：")).map(_.trim).getOrElse("")
-        val st = if (rc2 != 0 || failN > 0) Status.Fail else if (tbIsSkeleton) Status.Warn else Status.Ok
-        ctx.add(Step("sim", if (tbIsSkeleton) "仿真模型（骨架，未自检）" else "仿真模型（RTL 仿真）", st,
-          (if (tbIsSkeleton) "自动生成 TB 骨架，激励待补" else s"用例 ok=$okN fail=$failN") + (if (verdict.nonEmpty) s" · $verdict" else ""),
-          ms(t), tail(log2, 8)))
     }
+  }
+
+  /** Verilog 引用了 `xls_fifo_wrapper`（codegen 对 FIFO 通道只发实例）时，
+    * 找到 XLS 的模块源：仓库 third_party/ 优先，否则从 jar 资源解到 dstDir。 */
+  private def fifoWrapperSource(ctx: Ctx, dstDir: Path): Option[Path] = {
+    val name = "xls_fifo_wrapper.sv"
+    val dst = dstDir.resolve(name)
+    val inRepo = ctx.cfg.repoRoot.resolve("third_party/xls/xls/modules/zstd/rtl").resolve(name)
+    if (Files.exists(inRepo)) { Files.copy(inRepo, dst, StandardCopyOption.REPLACE_EXISTING); return Some(dst) }
+    val res = getClass.getResourceAsStream(s"/p4xls/$name")
+    if (res == null) return None
+    Files.copy(res, dst, StandardCopyOption.REPLACE_EXISTING)
+    res.close()
+    Some(dst)
   }
 
   private def ms(t0: Long): Long = (System.nanoTime() - t0) / 1000000L

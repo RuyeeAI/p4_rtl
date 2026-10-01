@@ -102,6 +102,23 @@ module tb_demo9_l3forwarder;
     end
   endtask
 
+  // 发包 + 一拍撤 vld：proc 停在 ph0 等包，一个 vld 脉冲必收且只收一次。
+  // （若 vld 一直挂着，proc 转完一圈回 ph0 会把同一个包再收一遍，
+  //   产生陈旧结果脉冲 —— verilator/iverilog 调度基线不同，TB 可能采错包。）
+  task send_udp_one;
+    begin
+      send_udp;
+      @(negedge clk); pkt_in_vld = 0;
+    end
+  endtask
+
+  task send_tcp_one;
+    begin
+      send_tcp;
+      @(negedge clk); pkt_in_vld = 0;
+    end
+  endtask
+
   // 检查关键字段（不逐位比 564 位，只比“会被本程序改动”的字段 + 两个 valid）
   task check(input [15:0] np, input [7:0] cls, input [7:0] drop, input [7:0] badver,
              input [7:0] ecnq, input [15:0] flowhash, input [15:0] swapid,
@@ -160,13 +177,14 @@ module tb_demo9_l3forwarder;
     @(negedge clk); rst = 0;
 
     // 包 1：UDP，l2_fwd 命中 forward(1,1)，acl miss
-    @(negedge clk); send_udp;
+    send_udp_one;
     check(16'h0001, 8'h01, 8'h00, 8'h00, 8'h00, 16'hEDCC, 16'h3412,
           8'h3F, 1'b1, 1'b0, 16'd67, 16'd0, 32'd1, 32'd0, 1);
-    send_tcp;
+    repeat (2) @(negedge clk);   // 等 proc 回 ph0 停稳（不复位）
+    // 包 2：TCP，l2_fwd 命中 forward(2,2)，acl 命中 trap
+    send_tcp_one;
     check(16'h0002, 8'h02, 8'h01, 8'h00, 8'h00, 16'hA988, 16'h7856,
           8'h3F, 1'b0, 1'b1, 16'd67, 16'd54, 32'd1, 32'd1, 2);
-    pkt_in_vld = 0;
 
     $display("============================================================");
     if (errors == 0) $display(" 结果：全部通过");
