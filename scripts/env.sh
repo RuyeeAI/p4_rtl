@@ -32,10 +32,10 @@ case ":$PATH:" in
   *) export PATH="$P4XLS_TOOLS/bin:$PATH" ;;
 esac
 
-# ---- 黄金对拍工具链（工程外同级 ../p4x：官方 p4c-bm2-ss + bmv2 simple_switch）----
-# A5 三级对拍第一级用它产出 golden 报文；预编译 dist 不进本工程（75MB + 绝对路径
-# dylib），重构建配方已收编到 packaging/（产物落 ../third_party/dist）。
-export P4X_HOME="${P4X_HOME:-$P4XLS_ROOT/../p4x}"
+# ---- 黄金对拍工具链（工程外同级 third_party/dist：官方 p4c-bm2-ss + bmv2）----
+# 驱动脚本 scripts/golden_sim.{sh,py}（原 ../p4x 的 p4xlib，2026-10-02 收编）；
+# 重构建配方 packaging/（产物落 P4X_GOLDEN_DIST）。二进制不进本工程（75MB + 绝对路径 dylib）。
+export P4X_GOLDEN_DIST="${P4X_GOLDEN_DIST:-$P4XLS_THIRD_PARTY/dist}"
 
 # ---- XLS 源码位置（工程外同级 third_party/，下面要用它读 .bazelversion） ----
 export XLS_SRC="$P4XLS_THIRD_PARTY/xls"

@@ -258,3 +258,16 @@ P4C 的 2,900 行早已 fork 进本工程（`src/main/scala/P4C/`，§5 的复�
 3. p4x 侧踩到一个真 bug：`sim` 以输出目录为 cwd 启动 `simple_switch`，但 bmv2 JSON
    传的是调用方相对路径 → `JSON input file cannot be opened`（相对 `-o` 必现）。
    `scripts/golden_sim.sh` 已统一把 `-o` 转绝对路径规避（注释里记了出处）。
+
+### 10.1 终局：p4x 目录删除（2026-10-02）
+
+可取之处全部并入后 `../p4x` 已删除：
+
+| 资产 | 去向 |
+|---|---|
+| `p4xlib`（sim 驱动 + 工具链定位） | **收编为 `scripts/golden_sim.py`**（自包含，修掉输入 P4/输出目录两处相对路径 bug），`golden_sim.sh` 变薄壳 |
+| `dist/` 预编译工具链 | **迁至 `../third_party/dist`**，`env.sh` 的 `P4X_HOME` 改为 `P4X_GOLDEN_DIST` |
+| `examples/l2_fwd.p4` | `testcases/golden/l2_fwd.p4`（golden 链自检样本，进版本管理） |
+| `packaging/` | 早已收编（见 §10 表） |
+| `p4chisel.jar` / `ppal` / `doctor` | 不收编（被 fat jar 取代 / 依赖旧 jar；`../P4C` 可随时重建） |
+| `build/`（368MB 构建树） | 随目录删除（packaging 配方可重建） |

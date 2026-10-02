@@ -39,6 +39,6 @@ brew install cmake ninja bison autoconf automake libtool ccache jsoncpp \
 
 - `build-p4chisel-jar.sh`：打的是旧 P4C 的 `p4chisel.jar`，本工程的 fat jar
   （`sbt cli/assembly` → `p4xls.jar`）已取代，**不再需要**。
-- `dist/` 预编译二进制（75MB）：留在 `../p4x/dist` 不拷进本工程（二进制 +
-  绝对路径 dylib 依赖，进了工程会让 IDE/仓库体积退化）。本工程通过
-  `P4X_HOME` 引用它；需要时用上面的脚本在 `../third_party/dist` 重建。
+- ~~`dist/` 预编译二进制（75MB）~~：原留在 `../p4x/dist`；**2026-10-02 p4x 目录删除，
+  dist 迁至 `../third_party/dist`**（本工程通过 `P4X_GOLDEN_DIST` 引用；驱动脚本
+  `scripts/golden_sim.{sh,py}` 已自包含）。需要时用上面的脚本在此处重建。

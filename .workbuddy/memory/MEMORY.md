@@ -180,19 +180,21 @@ XLS 线出 pkt_out 通道；Chisel 线告警跳过）、
 - 本工程已删：`em/` 子工程（build.sbt em 块 + 5 个 scala）、`testcases/a3/tb_em.v`、
   `out/a3`；root/cli 纯 Scala 不变。
 
-## 黄金对拍工具链（A5 第一级，2026-10-01/02 自 ../p4x 合并）
+## 黄金对拍工具链（A5 第一级，2026-10-01/02 自 ../p4x 合并，**p4x 已删除**）
 
-- `../p4x`（同级非 git 原型工程）的**官方 p4c-bm2-ss + bmv2 simple_switch** 是
-  三级对拍的 golden 源；预编译 `../p4x/dist`（75MB，**不进本工程**，绝对路径 dylib）。
-- `scripts/golden_sim.sh <p4> -o <dir>`：p4c-bm2-ss → bmv2 `--use-files` 无头仿真
-  → pcap 输出帧；`env.sh` 的 `P4X_HOME` 定位工具链（默认 `../p4x`）。
+- 官方 **p4c-bm2-ss + bmv2 simple_switch** 预编译在 `../third_party/dist`
+  （75MB，绝对路径 dylib，不进本工程）；`env.sh` 的 `P4X_GOLDEN_DIST` 定位。
+- **`scripts/golden_sim.py`**（自包含，收编自原 p4xlib）+ `golden_sim.sh` 薄壳：
+  `scripts/golden_sim.sh <p4> -o <dir>` → p4c 编译 + bmv2 `--use-files` 无头仿真
+  → pcap 输出帧；自检样本 `testcases/golden/l2_fwd.p4`。
 - **`packaging/`（本工程版本管理）**：官方 p4c/bmv2 的 macOS-arm64 构建配方，
   源=`../third_party/{p4c,behavioral-model}`、产物=`../third_party/dist`、
   构建=`../third_party/.build/`；坑清单见 `packaging/README.md`。
 - ⚠️ **本工程样本过不了官方 p4c**：demo12 报 `syntax error ... Register`
   （自研子集顶层 extern 非 v1model 语法）⇒ A5 对拍需另备官方可编译变体样本。
-- ⚠️ p4x 的 bug：`sim` 以输出目录为 cwd 却传相对 bmv2 JSON → 打不开；
-  golden_sim.sh 已把 `-o` 统一转绝对路径规避。
+- ⚠️ 原 p4x 的 bug（已修）：p4c/simple_switch 以输出目录为 cwd，输入 P4 与 bmv2 JSON
+  都必须**绝对路径**，否则打不开。
+- ⚠️ dist 二进制依赖 Homebrew 绝对路径 dylib（换机重装依赖或 dylibbundler 收口）。
 
 ## 报文窗口与偏移口径（2026-10-02 定）
 
