@@ -122,6 +122,34 @@ object Ast {
     * 组内各表 action 的写集互斥；组内各表的 key 读集不得依赖组内其他表的写集。 */
   final case class LookupGroup(name: String, tables: Seq[String], line: Int)
 
+  /** runtime 表的**外部接口契约**（A5 对拍 / 外部表模块 EM 对齐用）。
+    *
+    * 布局与 XlsBackend 生成 IR 时完全一致（单一事实源，避免两处漂移）：
+    * {{{
+    *   key 通道：各 key 元素按声明序拼接（先声明在高位）
+    *   rsp 通道：hit(1) | actId(actW) | args(argW)   —— hit 在最高位
+    *   args：各 action 形参按声明序拼接（先声明在高位）
+    * }}}
+    * @param size        表深（`// p4c: table ... size=N`，缺省 [[Directive.DefaultTableSize]]）
+    * @param latencyMin  外部表模块响应延时下界（拍）；None = 未配置
+    * @param latencyMax  响应延时上界（拍）
+    * @param keyFields   key 元素（字段路径, 位宽），按声明序
+    * @param actions     action 名 + 形参（名, LSB 偏移, 位宽），按声明序（actId = 下标）
+    */
+  final case class TableContract(
+    name: String,
+    size: Int,
+    latencyMin: Option[Int],
+    latencyMax: Option[Int],
+    keyFields: Seq[(String, Int)],
+    actions: Seq[(String, Seq[(String, Int, Int)])],
+  ) {
+    val keyBits: Int = keyFields.map(_._2).sum
+    val actW: Int = math.max(1, BigInt(math.max(0, actions.size - 1)).bitLength)
+    val argW: Int = actions.map(_._2.map(_._3).sum).foldLeft(0)(math.max)
+    val rspBits: Int = 1 + actW + argW
+  }
+
   final case class P4Program(
     headerTypes: Seq[HeaderType],
     structs: Seq[StructType],
@@ -133,6 +161,8 @@ object Ast {
       * 覆盖（缺省 [[DefaultPktWindowBits]]）。可选封装（多层 VLAN / OpaqueTag）按
       * **固定槽位**解析，窗口必须覆盖最坏情况（所有槽位都占满）的字节数。 */
     pktWindowBits: Int = P4Program.DefaultPktWindowBits,
+    /** runtime 表的外部接口契约（解析期算好，供 p4flow 导出 JSON / 生成表 mock TB）。 */
+    tableContracts: Seq[TableContract] = Seq.empty,
   )
 
   object P4Program {

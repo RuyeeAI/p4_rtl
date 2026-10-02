@@ -101,8 +101,54 @@ class Parser(toks0: Seq[Tok], scan: Directive.ScanResult = Directive.ScanResult.
     val pktWindowBits = scan.pktWindowDirectives.headOption.map(_._2)
       .getOrElse(P4Program.DefaultPktWindowBits)
 
+    // ---- runtime 表的外部接口契约（p4flow 导出 JSON / 生成 mock TB 都用它）----
+    // 字段路径里的首段是**形参名**（`hdr`/`meta`），不是 struct 类型名 ⇒ 先建别名表
+    val aliasToStruct: Map[String, String] =
+      (parsers.toSeq.flatMap(_.params) ++ controls.toSeq.flatMap(_.params))
+        .filter((p: ControlParam) => p.typeName != "packet_in" && p.typeName != "packet_out")
+        .map(p => p.name -> p.typeName).toMap
+    def structByAlias(n: String): Option[StructType] =
+      structs.find(_.name == n).orElse(aliasToStruct.get(n).flatMap(sn => structs.find(_.name == sn)))
+    def fieldWidthOf(p: Seq[String]): Option[Int] = p match {
+      case Seq(sname, fname) => // meta.xxx（struct 里的 bits 字段）
+        for {
+          st <- structByAlias(sname)
+          m  <- st.members.find(_.name == fname)
+          w  <- if (m.isBits) Some(m.bitsWidth)
+                else headerTypes.find(_.name == m.typeName).flatMap(_.fields.find(_.name == fname)).map(_.width)
+        } yield w
+      case Seq(hname, inst, fname) => // hdr.ethernet.dstAddr（header 实例字段）
+        for {
+          st <- structByAlias(hname)
+          m  <- st.members.find(_.name == inst)
+          ht <- headerTypes.find(_.name == m.typeName)
+          f  <- ht.fields.find(_.name == fname)
+        } yield f.width
+      case _ => None
+    }
+    val tableContracts: Seq[TableContract] = controls.toSeq.flatMap { c =>
+      val actsByName = c.actions.map(a => a.name -> a).toMap
+      c.tables.filter(_.isRuntime).map { t =>        val keyFields = t.keys.map { ke => ke.expr match {
+          case Name(p, _) => (p.mkString("."), fieldWidthOf(p).getOrElse(0))
+          case _          => ("?", 0)
+        } }
+        val actions = t.actions.map { an =>
+          val a = actsByName.getOrElse(an,
+            throw new P4Error(s"表 '${t.name}' 引用了未知 action '$an'"))
+          // LSB 偏移 = 其后所有形参宽度之和（先声明者占高位，与 IR 生成同口径）
+          (an, a.params.zipWithIndex.map { case (prm, j) =>
+            (prm.name, a.params.drop(j + 1).map(_.width).sum, prm.width)
+          })
+        }
+        TableContract(t.name,
+          if (t.runtimeSize > 0) t.runtimeSize else Directive.DefaultTableSize,
+          t.latencyMin, t.latencyMax, keyFields, actions)
+      }
+    }
+
     P4Program(headerTypes.toSeq, structs.toSeq, controls.toSeq, parsers.toSeq,
-      deparser = deparser, lookupGroups = lookupGroups, pktWindowBits = pktWindowBits)
+      deparser = deparser, lookupGroups = lookupGroups, pktWindowBits = pktWindowBits,
+      tableContracts = tableContracts)
   }
 
   /** 顶层 const 常量表（R5）：name → (值, 声明宽)。[[parsePrimary]] 处按名替换为带宽字面量。 */
